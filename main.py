@@ -3,6 +3,7 @@ import base64
 import binascii
 import hashlib
 import hmac
+import json
 import os
 import sys
 import logging
@@ -18,6 +19,12 @@ from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
 from playwright_captcha.utils.camoufox_add_init_script.add_init_script import get_addon_path
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+
+STATE_FILE = Path(__file__).resolve().parent / 'renewal_state.json'
+DASHBOARD_URL = 'https://secure.xserver.ne.jp/xapanel/xvps/index'
+LOGIN_URL = 'https://secure.xserver.ne.jp/xapanel/login/xvps/'
+OTP_PATH = '/xapanel/myaccount/twostepauth/index'
+OTP_DO_PATH = '/xapanel/myaccount/twostepauth/do'
 
 ENV_KEYS = (
     'EMAIL',
@@ -70,6 +77,53 @@ def generate_totp(secret: str, interval: int = 30, digits: int = 6) -> str:
 def parse_japanese_date(raw: str) -> date:
     normalized = raw.strip().replace('年', '-').replace('月', '-').replace('日', '')
     return datetime.strptime(normalized, '%Y-%m-%d').date()
+
+
+def today_in_jst() -> date:
+    return datetime.now(ZoneInfo('Asia/Tokyo')).date()
+
+
+def load_local_state() -> dict:
+    if not STATE_FILE.exists():
+        return {}
+
+    try:
+        return json.loads(STATE_FILE.read_text(encoding='utf-8'))
+    except Exception as exc:
+        logging.warning(f'Failed to read local renewal state: {exc}')
+        return {}
+
+
+def save_local_state(info: dict, today_jst: date):
+    if not info.get('expiry_date_raw'):
+        return
+
+    payload = {
+        'next_expiry_date': parse_japanese_date(info['expiry_date_raw']).isoformat(),
+        'expiry_date_raw': info['expiry_date_raw'],
+        'update_date_raw': info.get('update_date_raw', ''),
+        'service_code': info.get('service_code', ''),
+        'server_name': info.get('server_name', ''),
+        'uuid': info.get('uuid', ''),
+        'last_checked_jst': today_jst.isoformat(),
+        'updated_at_utc': datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
+    }
+    STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
+    logging.info('Local renewal state updated: %s', payload['next_expiry_date'])
+
+
+def should_attempt_login_from_state(state: dict, today_jst: date) -> bool:
+    next_expiry = state.get('next_expiry_date')
+    if not next_expiry:
+        return True
+
+    try:
+        expiry_date = datetime.strptime(next_expiry, '%Y-%m-%d').date()
+    except ValueError:
+        return True
+
+    renewal_open_date = expiry_date - timedelta(days=1)
+    return renewal_open_date <= today_jst <= expiry_date
 
 
 def format_server_info_message(prefix: str, info: dict, today_jst: date, should_renew: bool | None = None) -> str:
@@ -144,25 +198,148 @@ def normalize_server_info(server_info_raw: dict) -> dict:
 
 
 async def complete_optional_otp(page, otp_secret: str):
-    otp_path = '/xapanel/myaccount/twostepauth/index'
-
     for _ in range(60):
         current_url = page.url
         if '/xapanel/xvps/' in current_url:
             return
-        if otp_path in current_url:
-            logging.info('Two-step authentication detected. Submitting TOTP code...')
-            if not otp_secret:
-                raise RuntimeError('Two-step authentication page detected but AUTH_LOGIN_OTP is not set.')
-
-            await page.wait_for_selector('input[name="auth_code"]', timeout=10000)
-            otp_code = generate_totp(otp_secret)
-            await page.locator('input[name="auth_code"]').fill(otp_code)
-            await page.locator('input[type="submit"][value="ログイン"]').click(no_wait_after=True)
+        if OTP_PATH in current_url or OTP_DO_PATH in current_url:
+            await submit_otp_with_retries(page, otp_secret)
             return
         await asyncio.sleep(0.5)
 
     raise TimeoutError('Timed out waiting for either the XServer dashboard or the two-step authentication page.')
+
+
+async def submit_otp_with_retries(page, otp_secret: str, max_attempts: int = 3):
+    if not otp_secret:
+        raise RuntimeError('Two-step authentication page detected but AUTH_LOGIN_OTP is not set.')
+
+    for attempt in range(1, max_attempts + 1):
+        if OTP_DO_PATH in page.url:
+            logging.info('OTP submit endpoint is still open. Trying dashboard URL directly...')
+            await page.goto(DASHBOARD_URL, wait_until='domcontentloaded', timeout=60000)
+            return
+
+        logging.info('Two-step authentication detected. Submitting TOTP code (attempt %s/%s)...', attempt, max_attempts)
+        await page.wait_for_selector('input[name="auth_code"]', timeout=10000)
+
+        auth_input = page.locator('input[name="auth_code"]')
+        submit_button = page.locator('input[type="submit"][value="ログイン"]')
+        error_message = page.locator('text="認証コードが一致しません"')
+        otp_code = generate_totp(otp_secret)
+        await auth_input.fill(otp_code)
+        await click_submit_resiliently(submit_button, 'OTP login button', timeout=5000)
+
+        retried_click = False
+        for _ in range(30):
+            current_url = page.url
+            if '/xapanel/xvps/' in current_url:
+                return
+
+            if OTP_DO_PATH in current_url:
+                logging.info('OTP form reached submit endpoint. Opening dashboard to continue...')
+                await page.goto(DASHBOARD_URL, wait_until='domcontentloaded', timeout=60000)
+                return
+
+            if OTP_PATH not in current_url:
+                await asyncio.sleep(0.5)
+                continue
+
+            try:
+                input_value = await auth_input.input_value()
+            except Exception:
+                input_value = ''
+
+            try:
+                has_error = await error_message.is_visible()
+            except Exception:
+                has_error = False
+
+            if has_error or input_value == '':
+                logging.warning('OTP was rejected or cleared by the page. Retrying with a fresh code...')
+                break
+
+            if not retried_click:
+                logging.info('OTP page is still open; retrying the login click once more...')
+                await click_submit_resiliently(submit_button, 'OTP login button retry', timeout=5000)
+                retried_click = True
+
+            await asyncio.sleep(0.5)
+        else:
+            logging.warning('OTP page did not advance after submission attempt %s.', attempt)
+
+    raise RuntimeError('Failed to complete two-step authentication after multiple attempts.')
+
+
+async def submit_primary_login(page, email: str, password: str):
+    await page.wait_for_selector('#memberid', timeout=10000)
+    await page.locator('#memberid').fill(email)
+    await page.locator('#user_password').fill(password)
+    await click_submit_resiliently(page.locator('text="ログインする"'), 'Primary login button', timeout=5000)
+
+
+async def ensure_dashboard_loaded(page, otp_secret: str, email: str, password: str, timeout_ms: int = 90000):
+    dashboard_link = page.locator('a[href^="/xapanel/xvps/server/detail?id="]')
+    deadline = time.time() + timeout_ms / 1000
+    last_forced_dashboard_visit = 0.0
+
+    while time.time() < deadline:
+        current_url = page.url
+        can_force_dashboard = (time.time() - last_forced_dashboard_visit) >= 10
+
+        try:
+            if await dashboard_link.first.is_visible(timeout=1000):
+                return
+        except Exception:
+            pass
+
+        if OTP_PATH in current_url:
+            await submit_otp_with_retries(page, otp_secret)
+            continue
+
+        if OTP_DO_PATH in current_url and can_force_dashboard:
+            logging.info('Landed on OTP submit endpoint. Trying to open XVPS dashboard directly...')
+            await page.goto(DASHBOARD_URL, wait_until='domcontentloaded', timeout=60000)
+            last_forced_dashboard_visit = time.time()
+            continue
+
+        if '/xapanel/xvps/' in current_url and can_force_dashboard:
+            logging.info('Already inside XVPS area but dashboard is not ready yet. Refreshing dashboard URL...')
+            await page.goto(DASHBOARD_URL, wait_until='domcontentloaded', timeout=60000)
+            last_forced_dashboard_visit = time.time()
+            continue
+
+        if (current_url == LOGIN_URL or '/xapanel/login/' in current_url) and can_force_dashboard:
+            logging.info('Login page still appears active. Resubmitting credentials once before dashboard recovery...')
+            try:
+                await submit_primary_login(page, email, password)
+                last_forced_dashboard_visit = time.time()
+                continue
+            except Exception as exc:
+                logging.warning(f'Login resubmit did not finish cleanly: {exc}')
+
+            logging.info('Trying to open XVPS dashboard directly...')
+            await page.goto(DASHBOARD_URL, wait_until='domcontentloaded', timeout=60000)
+            last_forced_dashboard_visit = time.time()
+            continue
+
+        await asyncio.sleep(1)
+
+    raise TimeoutError('Timed out waiting for the XServer dashboard to become available.')
+
+
+async def click_submit_resiliently(locator, description: str, timeout: int = 8000):
+    try:
+        await locator.click(timeout=timeout, no_wait_after=True)
+        return
+    except Exception as exc:
+        logging.warning(f'{description} click did not finish cleanly: {exc}')
+
+    try:
+        await locator.evaluate('(el) => el.click()')
+        logging.info('%s clicked via DOM fallback.', description)
+    except Exception as exc:
+        logging.warning(f'{description} DOM click fallback failed: {exc}')
 
 
 async def is_effectively_enabled(locator) -> bool:
@@ -199,6 +376,40 @@ async def wait_for_effectively_enabled(locator, timeout_ms: int = 20000, poll_ms
     return await is_effectively_enabled(locator)
 
 
+async def close_free_user_campaign_modal(page):
+    modal = page.locator('#campaignModalForFreeUsers')
+    close_button = page.locator('#campaignModalForFreeUsers .modal__close')
+
+    try:
+        if not await modal.is_visible(timeout=2000):
+            return
+    except Exception:
+        return
+
+    logging.info('Closing free-user campaign modal...')
+
+    try:
+        await close_button.click(timeout=5000)
+        await modal.wait_for(state='hidden', timeout=5000)
+        logging.info('Free-user campaign modal closed via close button.')
+        return
+    except Exception as exc:
+        logging.warning(f'Close button did not dismiss modal cleanly: {exc}')
+
+    await page.evaluate(
+        """
+        () => {
+            const modal = document.querySelector('#campaignModalForFreeUsers');
+            if (!modal) return;
+            modal.classList.remove('isOpen');
+            modal.style.display = 'none';
+            document.body.classList.remove('is-modal-open');
+        }
+        """
+    )
+    logging.info('Free-user campaign modal hidden via DOM fallback.')
+
+
 async def main():
     load_local_env()
 
@@ -209,6 +420,16 @@ async def main():
     notice_tg_userid = os.getenv('NOTICE_TG_USERID', '')
     proxy_server = os.getenv('PROXY_SERVER')
     debug_mode = os.getenv('DEBUG', 'false').lower() == 'true'
+    today_jst = today_in_jst()
+    local_state = load_local_state()
+
+    if not should_attempt_login_from_state(local_state, today_jst):
+        logging.info(
+            'SKIP: Local state says renewal window is not open yet. next_expiry_date=%s today_jst=%s',
+            local_state.get('next_expiry_date', '-'),
+            today_jst.isoformat(),
+        )
+        return
 
     options = {
         'headless': not debug_mode,
@@ -245,20 +466,15 @@ async def main():
         try:
             logging.info('Navigating to login...')
             # Use domcontentloaded to avoid getting stuck on tracking pixels
-            await page.goto('https://secure.xserver.ne.jp/xapanel/login/xvps/', wait_until='domcontentloaded', timeout=60000)
+            await page.goto(LOGIN_URL, wait_until='domcontentloaded', timeout=60000)
             await page.wait_for_selector('#memberid', timeout=30000)
             
-            await page.locator('#memberid').fill(email)
-            await page.locator('#user_password').fill(password)
-            
             logging.info('Logging in...')
-            await page.locator('text="ログインする"').click(no_wait_after=True)
+            await submit_primary_login(page, email, password)
 
-            logging.info('Waiting for dashboard or two-step authentication...')
-            await complete_optional_otp(page, auth_login_otp)
-
-            logging.info('Waiting for dashboard to load...')
-            await page.wait_for_selector('a[href^="/xapanel/xvps/server/detail?id="]', timeout=30000)
+            logging.info('Ensuring dashboard is fully reachable...')
+            await ensure_dashboard_loaded(page, auth_login_otp, email, password)
+            await close_free_user_campaign_modal(page)
 
             logging.info('Navigating server details...')
             await page.locator('a[href^="/xapanel/xvps/server/detail?id="]').first.click(no_wait_after=True)
@@ -274,20 +490,22 @@ async def main():
                 raise RuntimeError('Could not find 利用期限 on the server detail page.')
 
             expiry_date = parse_japanese_date(server_info['expiry_date_raw'])
-            today_jst = datetime.now(ZoneInfo('Asia/Tokyo')).date()
-            should_renew = today_jst == (expiry_date - timedelta(days=1))
+            renewal_open_date = expiry_date - timedelta(days=1)
+            should_renew = renewal_open_date <= today_jst <= expiry_date
+            save_local_state(server_info, today_jst)
 
             logging.info(
-                'Server detail: service_code=%s expiry=%s last_update=%s today_jst=%s should_renew=%s',
+                'Server detail: service_code=%s expiry=%s last_update=%s today_jst=%s renewal_open_date=%s should_renew=%s',
                 server_info['service_code'] or '-',
                 server_info['expiry_date_raw'],
                 server_info['update_date_raw'] or '-',
                 today_jst.isoformat(),
+                renewal_open_date.isoformat(),
                 should_renew,
             )
 
             if not should_renew:
-                logging.info('SKIP: Today is not the day before expiry, so renewal will not be attempted.')
+                logging.info('SKIP: Today is outside the renewal window (day before expiry through expiry day).')
                 await send_tg_notice(
                     notice_tg_token,
                     notice_tg_userid,
@@ -374,6 +592,7 @@ async def main():
                     await page.goto(detail_url, wait_until='domcontentloaded', timeout=60000)
                     await page.wait_for_selector('table.table', timeout=30000)
                     latest_server_info = normalize_server_info(await extract_server_info(page))
+                    save_local_state(latest_server_info, today_jst)
 
                     logging.info(
                         'Latest detail after renewal: service_code=%s expiry=%s last_update=%s',
