@@ -249,7 +249,12 @@ async def submit_otp_with_retries(page, otp_secret: str, max_attempts: int = 3):
         error_message = page.locator('text="認証コードが一致しません"')
         otp_code = generate_totp(otp_secret)
         await auth_input.fill(otp_code)
-        await click_submit_resiliently(submit_button, 'OTP login button', timeout=5000)
+        await click_submit_resiliently(
+            submit_button,
+            'OTP login button',
+            timeout=5000,
+            success_check=lambda: is_otp_or_dashboard_transition_complete(page),
+        )
 
         retried_click = False
         for _ in range(30):
@@ -282,8 +287,15 @@ async def submit_otp_with_retries(page, otp_secret: str, max_attempts: int = 3):
 
             if not retried_click:
                 logging.info('OTP page is still open; retrying the login click once more...')
-                await click_submit_resiliently(submit_button, 'OTP login button retry', timeout=5000)
+                await click_submit_resiliently(
+                    submit_button,
+                    'OTP login button retry',
+                    timeout=5000,
+                    success_check=lambda: is_otp_or_dashboard_transition_complete(page),
+                )
                 retried_click = True
+                if await is_otp_or_dashboard_transition_complete(page):
+                    continue
 
             await asyncio.sleep(0.5)
         else:
@@ -296,7 +308,12 @@ async def submit_primary_login(page, email: str, password: str):
     await page.wait_for_selector('#memberid', timeout=10000)
     await page.locator('#memberid').fill(email)
     await page.locator('#user_password').fill(password)
-    await click_submit_resiliently(page.locator('text="ログインする"'), 'Primary login button', timeout=5000)
+    await click_submit_resiliently(
+        page.locator('text="ログインする"'),
+        'Primary login button',
+        timeout=5000,
+        success_check=lambda: is_login_transition_started(page),
+    )
 
 
 async def ensure_dashboard_loaded(page, otp_secret: str, email: str, password: str, timeout_ms: int = 90000):
@@ -337,6 +354,9 @@ async def ensure_dashboard_loaded(page, otp_secret: str, email: str, password: s
                 last_forced_dashboard_visit = time.time()
                 continue
             except Exception as exc:
+                if OTP_PATH in page.url or OTP_DO_PATH in page.url or '/xapanel/xvps/' in page.url:
+                    logging.info('Login resubmit moved to %s; continuing recovery.', page.url)
+                    continue
                 logging.warning(f'Login resubmit did not finish cleanly: {exc}')
 
             logging.info('Trying to open XVPS dashboard directly...')
@@ -349,17 +369,37 @@ async def ensure_dashboard_loaded(page, otp_secret: str, email: str, password: s
     raise TimeoutError('Timed out waiting for the XServer dashboard to become available.')
 
 
-async def click_submit_resiliently(locator, description: str, timeout: int = 8000):
+async def is_login_transition_started(page) -> bool:
+    current_url = page.url
+    return (
+        OTP_PATH in current_url
+        or OTP_DO_PATH in current_url
+        or '/xapanel/xvps/' in current_url
+    )
+
+
+async def is_otp_or_dashboard_transition_complete(page) -> bool:
+    current_url = page.url
+    return OTP_DO_PATH in current_url or '/xapanel/xvps/' in current_url
+
+
+async def click_submit_resiliently(locator, description: str, timeout: int = 8000, success_check=None):
     try:
         await locator.click(timeout=timeout, no_wait_after=True)
         return
     except Exception as exc:
+        if success_check and await success_check():
+            logging.info('%s click timed out, but page already advanced.', description)
+            return
         logging.warning(f'{description} click did not finish cleanly: {exc}')
 
     try:
         await locator.evaluate('(el) => el.click()')
         logging.info('%s clicked via DOM fallback.', description)
     except Exception as exc:
+        if success_check and await success_check():
+            logging.info('%s DOM fallback skipped because page already advanced.', description)
+            return
         logging.warning(f'{description} DOM click fallback failed: {exc}')
 
 
