@@ -98,6 +98,7 @@ def save_local_state(info: dict, today_jst: date):
     if not info.get('expiry_date_raw'):
         return
 
+    previous = load_local_state()
     payload = {
         'next_expiry_date': parse_japanese_date(info['expiry_date_raw']).isoformat(),
         'expiry_date_raw': info['expiry_date_raw'],
@@ -108,8 +109,28 @@ def save_local_state(info: dict, today_jst: date):
         'last_checked_jst': today_jst.isoformat(),
         'updated_at_utc': datetime.utcnow().replace(microsecond=0).isoformat() + 'Z',
     }
+    for key in ('last_notice_jst', 'last_notice_reason'):
+        if previous.get(key):
+            payload[key] = previous[key]
+
     STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
     logging.info('Local renewal state updated: %s', payload['next_expiry_date'])
+
+
+def mark_notice_sent(today_jst: date, reason: str):
+    state = load_local_state()
+    state['last_notice_jst'] = today_jst.isoformat()
+    state['last_notice_reason'] = reason
+    state['notice_updated_at_utc'] = datetime.utcnow().replace(microsecond=0).isoformat() + 'Z'
+    STATE_FILE.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding='utf-8')
+
+
+def should_send_daily_notice(today_jst: date, reason: str) -> bool:
+    state = load_local_state()
+    return not (
+        state.get('last_notice_jst') == today_jst.isoformat()
+        and state.get('last_notice_reason') == reason
+    )
 
 
 def should_attempt_login_from_state(state: dict, today_jst: date) -> bool:
@@ -506,11 +527,16 @@ async def main():
 
             if not should_renew:
                 logging.info('SKIP: Today is outside the renewal window (day before expiry through expiry day).')
-                await send_tg_notice(
-                    notice_tg_token,
-                    notice_tg_userid,
-                    format_server_info_message('XServer VPS renewal skipped.', server_info, today_jst, should_renew=False),
-                )
+                notice_reason = 'skip_outside_renewal_window'
+                if should_send_daily_notice(today_jst, notice_reason):
+                    await send_tg_notice(
+                        notice_tg_token,
+                        notice_tg_userid,
+                        format_server_info_message('XServer VPS renewal skipped.', server_info, today_jst, should_renew=False),
+                    )
+                    mark_notice_sent(today_jst, notice_reason)
+                else:
+                    logging.info('SKIP: Daily Telegram notice already sent for %s.', notice_reason)
                 await page.screenshot(path='skip_renewal.png', full_page=True)
                 return
 
@@ -529,11 +555,16 @@ async def main():
             if await page.locator('.newApp__suspended').is_visible():
                 logging.info('SKIP: Renewal is not yet available (detected .newApp__suspended).')
                 logging.info('XServer: "利用期限の1日前から更新手続きが可能です。"')
-                await send_tg_notice(
-                    notice_tg_token,
-                    notice_tg_userid,
-                    format_server_info_message('XServer VPS renewal skipped: not yet available.', server_info, today_jst, should_renew=True),
-                )
+                notice_reason = 'skip_not_yet_available'
+                if should_send_daily_notice(today_jst, notice_reason):
+                    await send_tg_notice(
+                        notice_tg_token,
+                        notice_tg_userid,
+                        format_server_info_message('XServer VPS renewal skipped: not yet available.', server_info, today_jst, should_renew=True),
+                    )
+                    mark_notice_sent(today_jst, notice_reason)
+                else:
+                    logging.info('SKIP: Daily Telegram notice already sent for %s.', notice_reason)
                 await page.screenshot(path='skip_renewal.png', full_page=True)
                 return
 
