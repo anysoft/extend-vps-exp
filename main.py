@@ -25,6 +25,13 @@ DASHBOARD_URL = 'https://secure.xserver.ne.jp/xapanel/xvps/index'
 LOGIN_URL = 'https://secure.xserver.ne.jp/xapanel/login/xvps/'
 OTP_PATH = '/xapanel/myaccount/twostepauth/index'
 OTP_DO_PATH = '/xapanel/myaccount/twostepauth/do'
+FINAL_RENEW_BUTTON_TEXT = '無料VPSの利用を継続する'
+FINAL_RENEW_BUTTON_SELECTOR = (
+    f'input[type="submit"][value="{FINAL_RENEW_BUTTON_TEXT}"], '
+    f'button:has-text("{FINAL_RENEW_BUTTON_TEXT}"), '
+    f'a:has-text("{FINAL_RENEW_BUTTON_TEXT}")'
+)
+FINAL_RENEW_ATTEMPTS = 3
 
 ENV_KEYS = (
     'EMAIL',
@@ -437,6 +444,31 @@ async def wait_for_effectively_enabled(locator, timeout_ms: int = 20000, poll_ms
     return await is_effectively_enabled(locator)
 
 
+async def log_final_button_state(button, attempt: int):
+    try:
+        disabled = await button.is_disabled(timeout=2000)
+    except Exception as exc:
+        disabled = f'unknown ({exc})'
+
+    try:
+        aria_disabled = await button.get_attribute('aria-disabled', timeout=2000)
+    except Exception:
+        aria_disabled = None
+
+    try:
+        button_class = await button.get_attribute('class', timeout=2000)
+    except Exception:
+        button_class = None
+
+    logging.warning(
+        'Final renewal button is still disabled on attempt %s: disabled=%s aria-disabled=%s class=%s',
+        attempt,
+        disabled,
+        aria_disabled or '-',
+        button_class or '-',
+    )
+
+
 async def close_free_user_campaign_modal(page):
     modal = page.locator('#campaignModalForFreeUsers')
     close_button = page.locator('#campaignModalForFreeUsers .modal__close')
@@ -608,39 +640,62 @@ async def main():
                 await page.screenshot(path='skip_renewal.png', full_page=True)
                 return
 
-            logging.info('Retrieving captcha...')
-            body = await page.eval_on_selector('img[src^="data:"]', 'img => img.src')
-            
-            # Solve custom image captcha
-            async with aiohttp.ClientSession() as session:
-                async with session.post('https://captcha-120546510085.asia-northeast1.run.app', data=body) as resp:
-                    code = await resp.text()
-            
-            logging.info(f'Resolved captcha code: {code}')
-            
-            input_loc = page.locator('[placeholder="上の画像の数字を入力"]')
-            await input_loc.focus()
-            await input_loc.press_sequentially(code, delay=100)
-            
-            try:
-                # Use playwright-captcha library to handle the Turnstile challenge
-                async with ClickSolver(framework=framework, page=page) as solver:
-                    await solver.solve_captcha(captcha_container=page, captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE)
-                logging.info('Turnstile interaction finished.')
-            except Exception as e:
-                # Some solvers might throw errors even if the click was successful.
-                # We catch and log them as warnings to allow the script to proceed.
-                logging.warning(f'Turnstile solve loop exited: {e}')
+            button = page.locator(FINAL_RENEW_BUTTON_SELECTOR).first()
+            is_enabled = False
 
-            await page.wait_for_selector('text="無料VPSの利用を継続する"', timeout=60000)
-            await page.screenshot(path='before_click.png', full_page=True)
-            
-            button = page.locator('text="無料VPSの利用を継続する"')
-            logging.info('Waiting for final renewal button to become enabled...')
-            is_enabled = await wait_for_effectively_enabled(button, timeout_ms=60000, poll_ms=500)
+            for attempt in range(1, FINAL_RENEW_ATTEMPTS + 1):
+                if attempt > 1:
+                    logging.info(
+                        'Refreshing renewal confirmation page before retrying captcha/Turnstile (attempt %s/%s)...',
+                        attempt,
+                        FINAL_RENEW_ATTEMPTS,
+                    )
+                    await page.reload(wait_until='domcontentloaded', timeout=60000)
+                    await page.wait_for_selector(f'img[src^="data:"], .newApp__suspended, {FINAL_RENEW_BUTTON_SELECTOR}', timeout=30000)
+
+                    if await page.locator('.newApp__suspended').is_visible():
+                        logging.info('SKIP: Renewal is not yet available after retry refresh (detected .newApp__suspended).')
+                        await page.screenshot(path='skip_renewal.png', full_page=True)
+                        return
+
+                logging.info('Retrieving captcha (attempt %s/%s)...', attempt, FINAL_RENEW_ATTEMPTS)
+                body = await page.eval_on_selector('img[src^="data:"]', 'img => img.src')
+
+                # Solve custom image captcha
+                async with aiohttp.ClientSession() as session:
+                    async with session.post('https://captcha-120546510085.asia-northeast1.run.app', data=body) as resp:
+                        code = await resp.text()
+
+                logging.info(f'Resolved captcha code: {code}')
+
+                input_loc = page.locator('[placeholder="上の画像の数字を入力"]')
+                await input_loc.fill('')
+                await input_loc.focus()
+                await input_loc.press_sequentially(code, delay=100)
+
+                try:
+                    # Use playwright-captcha library to handle the Turnstile challenge
+                    async with ClickSolver(framework=framework, page=page) as solver:
+                        await solver.solve_captcha(captcha_container=page, captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE)
+                    logging.info('Turnstile interaction finished.')
+                except Exception as e:
+                    # Some solvers might throw errors even if the click was successful.
+                    # We catch and log them as warnings to allow the script to proceed.
+                    logging.warning(f'Turnstile solve loop exited: {e}')
+
+                await page.wait_for_selector(FINAL_RENEW_BUTTON_SELECTOR, timeout=60000)
+                await page.screenshot(path='before_click.png', full_page=True)
+
+                logging.info('Waiting for final renewal button to become enabled (attempt %s/%s)...', attempt, FINAL_RENEW_ATTEMPTS)
+                is_enabled = await wait_for_effectively_enabled(button, timeout_ms=60000, poll_ms=500)
+                if is_enabled:
+                    break
+
+                await log_final_button_state(button, attempt)
+                await page.screenshot(path=f'final_disabled_attempt_{attempt}.png', full_page=True)
 
             if not is_enabled:
-                err_msg = 'Final button is DISABLED! Renewal failed or Turnstile verification was unsuccessful.'
+                err_msg = f'Final button is DISABLED after {FINAL_RENEW_ATTEMPTS} attempts! Renewal failed or Turnstile verification was unsuccessful.'
                 logging.error(err_msg)
                 if not debug_mode:
                     raise Exception(err_msg)

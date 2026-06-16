@@ -38,7 +38,15 @@ EXIT_CODE=$?
 set -e
 
 echo "[3/4] Extracting artifacts..."
-ARTIFACTS=("recording.webm" "skip_renewal.png" "before_click.png" "after_click.png")
+ARTIFACTS=(
+    "recording.webm"
+    "skip_renewal.png"
+    "before_click.png"
+    "after_click.png"
+    "final_disabled_attempt_1.png"
+    "final_disabled_attempt_2.png"
+    "final_disabled_attempt_3.png"
+)
 
 # Clean up old local artifacts
 for f in "${ARTIFACTS[@]}"; do rm -f "./$f"; done
