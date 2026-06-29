@@ -25,6 +25,10 @@ DASHBOARD_URL = 'https://secure.xserver.ne.jp/xapanel/xvps/index'
 LOGIN_URL = 'https://secure.xserver.ne.jp/xapanel/login/xvps/'
 OTP_PATH = '/xapanel/myaccount/twostepauth/index'
 OTP_DO_PATH = '/xapanel/myaccount/twostepauth/do'
+DASHBOARD_DETAIL_LINK_SELECTOR = 'a[href^="/xapanel/xvps/server/detail?id="]'
+LOGIN_MEMBER_ID_SELECTOR = '#memberid'
+LOGIN_PASSWORD_SELECTOR = '#user_password'
+OTP_INPUT_SELECTOR = 'input[name="auth_code"]'
 FINAL_RENEW_BUTTON_TEXT = '無料VPSの利用を継続する'
 FINAL_RENEW_BUTTON_SELECTOR = (
     f'input[type="submit"][value="{FINAL_RENEW_BUTTON_TEXT}"], '
@@ -225,6 +229,101 @@ def normalize_server_info(server_info_raw: dict) -> dict:
     }
 
 
+async def safe_is_visible(locator, timeout: int = 500) -> bool:
+    try:
+        return await locator.first.is_visible(timeout=timeout)
+    except Exception:
+        return False
+
+
+async def capture_diagnostics(page, prefix: str):
+    try:
+        logging.error('Diagnostic page URL: %s', page.url)
+    except Exception:
+        pass
+
+    try:
+        logging.error('Diagnostic page title: %s', await page.title())
+    except Exception as exc:
+        logging.warning('Could not read diagnostic page title: %s', exc)
+
+    try:
+        body_text = await page.locator('body').inner_text(timeout=2000)
+        logging.error('Diagnostic body excerpt: %s', body_text[:1000].replace('\n', ' | '))
+    except Exception as exc:
+        logging.warning('Could not read diagnostic body text: %s', exc)
+
+    try:
+        await page.screenshot(path=f'{prefix}.png', full_page=True)
+        logging.error('Diagnostic screenshot saved: %s.png', prefix)
+    except Exception as exc:
+        logging.warning('Could not save diagnostic screenshot: %s', exc)
+
+    try:
+        Path(f'{prefix}.html').write_text(await page.content(), encoding='utf-8')
+        logging.error('Diagnostic HTML saved: %s.html', prefix)
+    except Exception as exc:
+        logging.warning('Could not save diagnostic HTML: %s', exc)
+
+
+async def detect_login_state(page) -> str:
+    current_url = page.url
+
+    if await safe_is_visible(page.locator(DASHBOARD_DETAIL_LINK_SELECTOR)):
+        return 'dashboard'
+    if OTP_DO_PATH in current_url:
+        return 'otp_submitted'
+    if await safe_is_visible(page.locator(OTP_INPUT_SELECTOR)):
+        return 'otp_form'
+    if await safe_is_visible(page.locator(LOGIN_MEMBER_ID_SELECTOR)):
+        return 'login_form'
+    if '/xapanel/xvps/' in current_url:
+        return 'xvps_area'
+    if OTP_PATH in current_url:
+        return 'otp_loading'
+    if '/xapanel/login/' in current_url:
+        return 'login_loading'
+    return 'unknown'
+
+
+async def wait_for_login_entry_state(page, timeout_ms: int = 45000) -> str:
+    deadline = time.time() + timeout_ms / 1000
+    last_logged_state = None
+
+    while time.time() < deadline:
+        state = await detect_login_state(page)
+        if state != last_logged_state:
+            logging.info('Login entry state: %s url=%s', state, page.url)
+            last_logged_state = state
+
+        if state in ('login_form', 'otp_form', 'otp_submitted', 'dashboard', 'xvps_area'):
+            return state
+
+        await asyncio.sleep(0.5)
+
+    await capture_diagnostics(page, 'login_entry_timeout')
+    raise TimeoutError(f'Timed out waiting for login, OTP, or dashboard state. Last state: {last_logged_state}. url={page.url}')
+
+
+async def wait_for_otp_state(page, timeout_ms: int = 45000) -> str:
+    deadline = time.time() + timeout_ms / 1000
+    last_logged_state = None
+
+    while time.time() < deadline:
+        state = await detect_login_state(page)
+        if state != last_logged_state:
+            logging.info('OTP wait state: %s url=%s', state, page.url)
+            last_logged_state = state
+
+        if state in ('otp_form', 'otp_submitted', 'dashboard', 'xvps_area', 'login_form'):
+            return state
+
+        await asyncio.sleep(0.5)
+
+    await capture_diagnostics(page, 'otp_wait_timeout')
+    raise TimeoutError(f'Timed out waiting for OTP input or dashboard transition. Last state: {last_logged_state}. url={page.url}')
+
+
 async def complete_optional_otp(page, otp_secret: str):
     for _ in range(60):
         current_url = page.url
@@ -243,15 +342,22 @@ async def submit_otp_with_retries(page, otp_secret: str, max_attempts: int = 3):
         raise RuntimeError('Two-step authentication page detected but AUTH_LOGIN_OTP is not set.')
 
     for attempt in range(1, max_attempts + 1):
-        if OTP_DO_PATH in page.url:
+        state = await wait_for_otp_state(page)
+
+        if state in ('dashboard', 'xvps_area'):
+            return
+
+        if state == 'otp_submitted' or OTP_DO_PATH in page.url:
             logging.info('OTP submit endpoint is still open. Trying dashboard URL directly...')
             await page.goto(DASHBOARD_URL, wait_until='domcontentloaded', timeout=60000)
             return
 
-        logging.info('Two-step authentication detected. Submitting TOTP code (attempt %s/%s)...', attempt, max_attempts)
-        await page.wait_for_selector('input[name="auth_code"]', timeout=10000)
+        if state == 'login_form':
+            raise RuntimeError('Expected two-step authentication, but XServer returned to the primary login form.')
 
-        auth_input = page.locator('input[name="auth_code"]')
+        logging.info('Two-step authentication detected. Submitting TOTP code (attempt %s/%s)...', attempt, max_attempts)
+
+        auth_input = page.locator(OTP_INPUT_SELECTOR)
         submit_button = page.locator('input[type="submit"][value="ログイン"]')
         error_message = page.locator('text="認証コードが一致しません"')
         otp_code = generate_totp(otp_secret)
@@ -312,9 +418,13 @@ async def submit_otp_with_retries(page, otp_secret: str, max_attempts: int = 3):
 
 
 async def submit_primary_login(page, email: str, password: str):
-    await page.wait_for_selector('#memberid', timeout=10000)
-    await page.locator('#memberid').fill(email)
-    await page.locator('#user_password').fill(password)
+    state = await wait_for_login_entry_state(page, timeout_ms=30000)
+    if state != 'login_form':
+        logging.info('Primary login form is not needed; current state is %s.', state)
+        return
+
+    await page.locator(LOGIN_MEMBER_ID_SELECTOR).fill(email)
+    await page.locator(LOGIN_PASSWORD_SELECTOR).fill(password)
     await click_submit_resiliently(
         page.locator('text="ログインする"'),
         'Primary login button',
@@ -324,7 +434,7 @@ async def submit_primary_login(page, email: str, password: str):
 
 
 async def ensure_dashboard_loaded(page, otp_secret: str, email: str, password: str, timeout_ms: int = 90000):
-    dashboard_link = page.locator('a[href^="/xapanel/xvps/server/detail?id="]')
+    dashboard_link = page.locator(DASHBOARD_DETAIL_LINK_SELECTOR)
     deadline = time.time() + timeout_ms / 1000
     last_forced_dashboard_visit = 0.0
 
@@ -338,7 +448,7 @@ async def ensure_dashboard_loaded(page, otp_secret: str, email: str, password: s
         except Exception:
             pass
 
-        if OTP_PATH in current_url:
+        if OTP_PATH in current_url or await safe_is_visible(page.locator(OTP_INPUT_SELECTOR)):
             await submit_otp_with_retries(page, otp_secret)
             continue
 
@@ -373,6 +483,7 @@ async def ensure_dashboard_loaded(page, otp_secret: str, email: str, password: s
 
         await asyncio.sleep(1)
 
+    await capture_diagnostics(page, 'dashboard_timeout')
     raise TimeoutError('Timed out waiting for the XServer dashboard to become available.')
 
 
@@ -560,17 +671,20 @@ async def main():
             logging.info('Navigating to login...')
             # Use domcontentloaded to avoid getting stuck on tracking pixels
             await page.goto(LOGIN_URL, wait_until='domcontentloaded', timeout=60000)
-            await page.wait_for_selector('#memberid', timeout=30000)
+            login_state = await wait_for_login_entry_state(page, timeout_ms=45000)
             
-            logging.info('Logging in...')
-            await submit_primary_login(page, email, password)
+            if login_state == 'login_form':
+                logging.info('Logging in...')
+                await submit_primary_login(page, email, password)
+            else:
+                logging.info('Skipping primary login; current state is %s.', login_state)
 
             logging.info('Ensuring dashboard is fully reachable...')
             await ensure_dashboard_loaded(page, auth_login_otp, email, password)
             await close_free_user_campaign_modal(page)
 
             logging.info('Navigating server details...')
-            await page.locator('a[href^="/xapanel/xvps/server/detail?id="]').first.click(no_wait_after=True)
+            await page.locator(DASHBOARD_DETAIL_LINK_SELECTOR).first.click(no_wait_after=True)
             
             logging.info('Waiting for server detail page...')
             await page.wait_for_selector('text="更新する"', timeout=30000)
@@ -745,6 +859,7 @@ async def main():
         
         except Exception as e:
             logging.error(f'Script Error: {e}')
+            await capture_diagnostics(page, 'failure')
             try:
                 today_jst = datetime.now(ZoneInfo('Asia/Tokyo')).date()
                 await send_tg_notice(
