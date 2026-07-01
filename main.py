@@ -29,12 +29,13 @@ DASHBOARD_DETAIL_LINK_SELECTOR = 'a[href^="/xapanel/xvps/server/detail?id="]'
 LOGIN_MEMBER_ID_SELECTOR = '#memberid'
 LOGIN_PASSWORD_SELECTOR = '#user_password'
 OTP_INPUT_SELECTOR = 'input[name="auth_code"]'
+CAPTCHA_IMAGE_SELECTOR = 'img[src^="data:"]'
+SUSPENSION_SELECTOR = '.newApp__suspended'
+FREE_RENEW_SELECTION_TEXT = '引き続き無料VPSの利用を継続する'
+FREE_RENEW_SELECTION_SELECTOR = f'text="{FREE_RENEW_SELECTION_TEXT}"'
+RENEWAL_CONFIRM_PATH = '/xapanel/xvps/server/freevps/extend/conf'
 FINAL_RENEW_BUTTON_TEXT = '無料VPSの利用を継続する'
-FINAL_RENEW_BUTTON_SELECTOR = (
-    f'input[type="submit"][value="{FINAL_RENEW_BUTTON_TEXT}"], '
-    f'button:has-text("{FINAL_RENEW_BUTTON_TEXT}"), '
-    f'a:has-text("{FINAL_RENEW_BUTTON_TEXT}")'
-)
+FINAL_RENEW_BUTTON_SELECTOR = f'input[type="submit"][value="{FINAL_RENEW_BUTTON_TEXT}"]'
 FINAL_RENEW_ATTEMPTS = 3
 
 ENV_KEYS = (
@@ -322,6 +323,69 @@ async def wait_for_otp_state(page, timeout_ms: int = 45000) -> str:
 
     await capture_diagnostics(page, 'otp_wait_timeout')
     raise TimeoutError(f'Timed out waiting for OTP input or dashboard transition. Last state: {last_logged_state}. url={page.url}')
+
+
+async def wait_for_renewal_page_or_status(page, timeout_ms: int = 30000) -> str:
+    deadline = time.time() + timeout_ms / 1000
+    last_logged_state = None
+
+    while time.time() < deadline:
+        if await safe_is_visible(page.locator(SUSPENSION_SELECTOR)):
+            state = 'suspended'
+        elif await safe_is_visible(page.locator(CAPTCHA_IMAGE_SELECTOR)):
+            state = 'captcha'
+        elif await safe_is_visible(page.locator(FREE_RENEW_SELECTION_SELECTOR)):
+            state = 'selection'
+        elif RENEWAL_CONFIRM_PATH in page.url:
+            state = 'confirmation_loading'
+        elif await safe_is_visible(page.locator(FINAL_RENEW_BUTTON_SELECTOR)):
+            state = 'final_button'
+        else:
+            state = 'waiting'
+
+        if state != last_logged_state:
+            logging.info('Renewal page state: %s url=%s', state, page.url)
+            last_logged_state = state
+
+        if state in ('captcha', 'selection', 'suspended'):
+            return state
+
+        await asyncio.sleep(0.5)
+
+    await capture_diagnostics(page, 'renewal_page_timeout')
+    raise TimeoutError(f'Timed out waiting for renewal confirmation page. Last state: {last_logged_state}. url={page.url}')
+
+
+async def is_renewal_confirmation_transition_complete(page) -> bool:
+    return (
+        RENEWAL_CONFIRM_PATH in page.url
+        or await safe_is_visible(page.locator(CAPTCHA_IMAGE_SELECTOR))
+        or await safe_is_visible(page.locator(SUSPENSION_SELECTOR))
+    )
+
+
+async def open_free_renewal_confirmation(page, max_attempts: int = 3) -> str:
+    for attempt in range(1, max_attempts + 1):
+        state = await wait_for_renewal_page_or_status(page, timeout_ms=15000)
+        if state in ('captcha', 'suspended'):
+            return state
+
+        logging.info('Clicking free renewal selection (attempt %s/%s)...', attempt, max_attempts)
+        await click_submit_resiliently(
+            page.locator(FREE_RENEW_SELECTION_SELECTOR).first,
+            'Free renewal selection button',
+            timeout=8000,
+            success_check=lambda: is_renewal_confirmation_transition_complete(page),
+        )
+
+        state = await wait_for_renewal_page_or_status(page, timeout_ms=15000)
+        if state in ('captcha', 'suspended'):
+            return state
+
+        logging.warning('Free renewal selection did not advance to confirmation page on attempt %s.', attempt)
+
+    await capture_diagnostics(page, 'renewal_selection_timeout')
+    raise TimeoutError(f'Timed out opening free renewal confirmation page. url={page.url}')
 
 
 async def complete_optional_otp(page, otp_secret: str):
@@ -663,8 +727,12 @@ async def main():
     
     logging.info('Launching Camoufox in Python...')
     async with AsyncCamoufox(**options) as browser:
-        context = await browser.new_context()
+        context = await browser.new_context(
+            no_viewport=True,
+        )
         page = await context.new_page()
+        #context = await browser.new_context()
+        #page = await context.new_page()
         framework = FrameworkType.CAMOUFOX
 
         try:
@@ -729,16 +797,10 @@ async def main():
             await page.locator('text="更新する"').click()
 
             logging.info('Proceeding to renewal selection...')
-            await page.locator('text="引き続き無料VPSの利用を継続する"').click(no_wait_after=True)
-            
-            logging.info('Waiting for renewal page or status...')
-            
-            # Wait for either the captcha image OR the suspension notice section
-            # This will raise TimeoutError if neither appears within 30s (correct behavior)
-            await page.wait_for_selector('img[src^="data:"], .newApp__suspended', timeout=30000)
+            renewal_state = await open_free_renewal_confirmation(page)
             
             # If the suspension notice is visible, skip renewal gracefully
-            if await page.locator('.newApp__suspended').is_visible():
+            if renewal_state == 'suspended':
                 logging.info('SKIP: Renewal is not yet available (detected .newApp__suspended).')
                 logging.info('XServer: "利用期限の1日前から更新手続きが可能です。"')
                 notice_reason = 'skip_not_yet_available'
@@ -754,7 +816,7 @@ async def main():
                 await page.screenshot(path='skip_renewal.png', full_page=True)
                 return
 
-            button = page.locator(FINAL_RENEW_BUTTON_SELECTOR).first()
+            button = page.locator(FINAL_RENEW_BUTTON_SELECTOR).first
             is_enabled = False
 
             for attempt in range(1, FINAL_RENEW_ATTEMPTS + 1):
@@ -765,15 +827,17 @@ async def main():
                         FINAL_RENEW_ATTEMPTS,
                     )
                     await page.reload(wait_until='domcontentloaded', timeout=60000)
-                    await page.wait_for_selector(f'img[src^="data:"], .newApp__suspended, {FINAL_RENEW_BUTTON_SELECTOR}', timeout=30000)
+                    renewal_state = await wait_for_renewal_page_or_status(page, timeout_ms=30000)
+                    if renewal_state == 'selection':
+                        renewal_state = await open_free_renewal_confirmation(page)
 
-                    if await page.locator('.newApp__suspended').is_visible():
+                    if renewal_state == 'suspended':
                         logging.info('SKIP: Renewal is not yet available after retry refresh (detected .newApp__suspended).')
                         await page.screenshot(path='skip_renewal.png', full_page=True)
                         return
 
                 logging.info('Retrieving captcha (attempt %s/%s)...', attempt, FINAL_RENEW_ATTEMPTS)
-                body = await page.eval_on_selector('img[src^="data:"]', 'img => img.src')
+                body = await page.eval_on_selector(CAPTCHA_IMAGE_SELECTOR, 'img => img.src')
 
                 # Solve custom image captcha
                 async with aiohttp.ClientSession() as session:

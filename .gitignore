@@ -8,6 +8,7 @@ venv/
 
 # Artifacts
 *.png
+*.html
 *.webm
 
 skip_renewal.png
