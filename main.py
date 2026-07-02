@@ -29,13 +29,28 @@ DASHBOARD_DETAIL_LINK_SELECTOR = 'a[href^="/xapanel/xvps/server/detail?id="]'
 LOGIN_MEMBER_ID_SELECTOR = '#memberid'
 LOGIN_PASSWORD_SELECTOR = '#user_password'
 OTP_INPUT_SELECTOR = 'input[name="auth_code"]'
+OTP_SUBMIT_SELECTOR = (
+    'input[type="submit"][value="ログイン"], '
+    'button:has-text("ログイン"), '
+    'input[type="submit"], '
+    'button[type="submit"]'
+)
+OTP_SUBMIT_DOM_SELECTOR = 'input[type="submit"][value="ログイン"], input[type="submit"], button[type="submit"]'
 CAPTCHA_IMAGE_SELECTOR = 'img[src^="data:"]'
 SUSPENSION_SELECTOR = '.newApp__suspended'
-FREE_RENEW_SELECTION_TEXT = '引き続き無料VPSの利用を継続する'
-FREE_RENEW_SELECTION_SELECTOR = f'text="{FREE_RENEW_SELECTION_TEXT}"'
 RENEWAL_CONFIRM_PATH = '/xapanel/xvps/server/freevps/extend/conf'
+FREE_RENEW_SELECTION_TEXT = '引き続き無料VPSの利用を継続する'
+FREE_RENEW_SELECTION_BUTTON_SELECTOR = (
+    f'button[formaction="{RENEWAL_CONFIRM_PATH}"], '
+    'form.freeVpsBtnForm button[type="submit"]'
+)
+FREE_RENEW_SELECTION_TEXT_SELECTOR = f'text="{FREE_RENEW_SELECTION_TEXT}"'
 FINAL_RENEW_BUTTON_TEXT = '無料VPSの利用を継続する'
-FINAL_RENEW_BUTTON_SELECTOR = f'input[type="submit"][value="{FINAL_RENEW_BUTTON_TEXT}"]'
+FINAL_RENEW_BUTTON_SELECTOR = (
+    f'input[type="submit"][value="{FINAL_RENEW_BUTTON_TEXT}"], '
+    f'button:has-text("{FINAL_RENEW_BUTTON_TEXT}"), '
+    f'a:has-text("{FINAL_RENEW_BUTTON_TEXT}")'
+)
 FINAL_RENEW_ATTEMPTS = 3
 
 ENV_KEYS = (
@@ -84,6 +99,14 @@ def generate_totp(secret: str, interval: int = 30, digits: int = 6) -> str:
     offset = digest[-1] & 0x0F
     code_int = int.from_bytes(digest[offset:offset + 4], 'big') & 0x7FFFFFFF
     return str(code_int % (10 ** digits)).zfill(digits)
+
+
+async def wait_for_fresh_totp_window(interval: int = 30, min_remaining: int = 8):
+    remaining = interval - (int(time.time()) % interval)
+    if remaining < min_remaining:
+        wait_seconds = remaining + 1
+        logging.info('TOTP code is near expiry (%ss remaining). Waiting %ss for a fresh window...', remaining, wait_seconds)
+        await asyncio.sleep(wait_seconds)
 
 
 def parse_japanese_date(raw: str) -> date:
@@ -325,6 +348,13 @@ async def wait_for_otp_state(page, timeout_ms: int = 45000) -> str:
     raise TimeoutError(f'Timed out waiting for OTP input or dashboard transition. Last state: {last_logged_state}. url={page.url}')
 
 
+async def is_free_renewal_selection_visible(page) -> bool:
+    return (
+        await safe_is_visible(page.locator(FREE_RENEW_SELECTION_BUTTON_SELECTOR))
+        or await safe_is_visible(page.locator(FREE_RENEW_SELECTION_TEXT_SELECTOR))
+    )
+
+
 async def wait_for_renewal_page_or_status(page, timeout_ms: int = 30000) -> str:
     deadline = time.time() + timeout_ms / 1000
     last_logged_state = None
@@ -334,7 +364,7 @@ async def wait_for_renewal_page_or_status(page, timeout_ms: int = 30000) -> str:
             state = 'suspended'
         elif await safe_is_visible(page.locator(CAPTCHA_IMAGE_SELECTOR)):
             state = 'captcha'
-        elif await safe_is_visible(page.locator(FREE_RENEW_SELECTION_SELECTOR)):
+        elif await is_free_renewal_selection_visible(page):
             state = 'selection'
         elif RENEWAL_CONFIRM_PATH in page.url:
             state = 'confirmation_loading'
@@ -364,6 +394,34 @@ async def is_renewal_confirmation_transition_complete(page) -> bool:
     )
 
 
+async def submit_free_renewal_form_fallback(page) -> bool:
+    return await page.evaluate(
+        """
+        (selector) => {
+            const button = document.querySelector(selector);
+            if (!button) return false;
+
+            const form = button.form || button.closest('form');
+            if (!form) {
+                button.click();
+                return true;
+            }
+
+            const action = button.formAction || button.getAttribute('formaction');
+            if (action) form.action = action;
+
+            if (typeof form.requestSubmit === 'function') {
+                form.requestSubmit(button);
+            } else {
+                form.submit();
+            }
+            return true;
+        }
+        """,
+        FREE_RENEW_SELECTION_BUTTON_SELECTOR,
+    )
+
+
 async def open_free_renewal_confirmation(page, max_attempts: int = 3) -> str:
     for attempt in range(1, max_attempts + 1):
         state = await wait_for_renewal_page_or_status(page, timeout_ms=15000)
@@ -372,7 +430,7 @@ async def open_free_renewal_confirmation(page, max_attempts: int = 3) -> str:
 
         logging.info('Clicking free renewal selection (attempt %s/%s)...', attempt, max_attempts)
         await click_submit_resiliently(
-            page.locator(FREE_RENEW_SELECTION_SELECTOR).first,
+            page.locator(FREE_RENEW_SELECTION_BUTTON_SELECTOR).first,
             'Free renewal selection button',
             timeout=8000,
             success_check=lambda: is_renewal_confirmation_transition_complete(page),
@@ -382,10 +440,58 @@ async def open_free_renewal_confirmation(page, max_attempts: int = 3) -> str:
         if state in ('captcha', 'suspended'):
             return state
 
+        if state == 'selection':
+            logging.info('Free renewal selection click stayed on selection page; submitting the form via DOM fallback...')
+            submitted = await submit_free_renewal_form_fallback(page)
+            if not submitted:
+                logging.warning('Could not find free renewal selection form for DOM fallback.')
+
+            state = await wait_for_renewal_page_or_status(page, timeout_ms=20000)
+            if state in ('captcha', 'suspended'):
+                return state
+
         logging.warning('Free renewal selection did not advance to confirmation page on attempt %s.', attempt)
 
     await capture_diagnostics(page, 'renewal_selection_timeout')
     raise TimeoutError(f'Timed out opening free renewal confirmation page. url={page.url}')
+
+
+async def wait_for_final_renew_button(page, timeout_ms: int = 60000):
+    deadline = time.time() + timeout_ms / 1000
+    button = page.locator(FINAL_RENEW_BUTTON_SELECTOR).first
+    last_logged_state = None
+
+    while time.time() < deadline:
+        if await safe_is_visible(page.locator(SUSPENSION_SELECTOR)):
+            state = 'suspended'
+        elif await safe_is_visible(page.locator(FREE_RENEW_SELECTION_BUTTON_SELECTOR)):
+            state = 'selection'
+        elif await safe_is_visible(page.locator(FINAL_RENEW_BUTTON_SELECTOR)):
+            return button
+        elif RENEWAL_CONFIRM_PATH in page.url:
+            state = 'confirmation_waiting_for_final_button'
+        else:
+            state = 'waiting'
+
+        if state != last_logged_state:
+            logging.info('Final renewal button wait state: %s url=%s', state, page.url)
+            last_logged_state = state
+
+        if state == 'suspended':
+            await capture_diagnostics(page, 'final_button_suspended')
+            raise RuntimeError('Renewal page became suspended while waiting for the final renewal button.')
+
+        if state == 'selection':
+            logging.info('Returned to renewal selection page while waiting for final button; reopening confirmation...')
+            reopened_state = await open_free_renewal_confirmation(page)
+            if reopened_state == 'suspended':
+                await capture_diagnostics(page, 'final_button_suspended')
+                raise RuntimeError('Renewal page became suspended while reopening confirmation.')
+
+        await asyncio.sleep(0.5)
+
+    await capture_diagnostics(page, 'final_button_timeout')
+    raise TimeoutError(f'Timed out waiting for final renewal button. Last state: {last_logged_state}. url={page.url}')
 
 
 async def complete_optional_otp(page, otp_secret: str):
@@ -422,16 +528,10 @@ async def submit_otp_with_retries(page, otp_secret: str, max_attempts: int = 3):
         logging.info('Two-step authentication detected. Submitting TOTP code (attempt %s/%s)...', attempt, max_attempts)
 
         auth_input = page.locator(OTP_INPUT_SELECTOR)
-        submit_button = page.locator('input[type="submit"][value="ログイン"]')
+        submit_button = page.locator(OTP_SUBMIT_SELECTOR).first
         error_message = page.locator('text="認証コードが一致しません"')
-        otp_code = generate_totp(otp_secret)
-        await auth_input.fill(otp_code)
-        await click_submit_resiliently(
-            submit_button,
-            'OTP login button',
-            timeout=5000,
-            success_check=lambda: is_otp_or_dashboard_transition_complete(page),
-        )
+        await fill_otp_code(page, auth_input, otp_secret)
+        await submit_otp_and_wait(page, submit_button, 'OTP login button')
 
         retried_click = False
         for _ in range(30):
@@ -463,13 +563,9 @@ async def submit_otp_with_retries(page, otp_secret: str, max_attempts: int = 3):
                 break
 
             if not retried_click:
-                logging.info('OTP page is still open; retrying the login click once more...')
-                await click_submit_resiliently(
-                    submit_button,
-                    'OTP login button retry',
-                    timeout=5000,
-                    success_check=lambda: is_otp_or_dashboard_transition_complete(page),
-                )
+                logging.info('OTP page is still open; refilling a fresh code and retrying submit once more...')
+                await fill_otp_code(page, auth_input, otp_secret)
+                await submit_otp_and_wait(page, submit_button, 'OTP login button retry')
                 retried_click = True
                 if await is_otp_or_dashboard_transition_complete(page):
                     continue
@@ -478,6 +574,7 @@ async def submit_otp_with_retries(page, otp_secret: str, max_attempts: int = 3):
         else:
             logging.warning('OTP page did not advance after submission attempt %s.', attempt)
 
+    await capture_diagnostics(page, 'otp_submit_failed')
     raise RuntimeError('Failed to complete two-step authentication after multiple attempts.')
 
 
@@ -565,10 +662,24 @@ async def is_otp_or_dashboard_transition_complete(page) -> bool:
     return OTP_DO_PATH in current_url or '/xapanel/xvps/' in current_url
 
 
+async def wait_for_success(success_check, timeout_ms: int = 5000, poll_ms: int = 250) -> bool:
+    if not success_check:
+        return True
+
+    deadline = time.time() + timeout_ms / 1000
+    while time.time() < deadline:
+        if await success_check():
+            return True
+        await asyncio.sleep(poll_ms / 1000)
+    return await success_check()
+
+
 async def click_submit_resiliently(locator, description: str, timeout: int = 8000, success_check=None):
     try:
         await locator.click(timeout=timeout, no_wait_after=True)
-        return
+        if await wait_for_success(success_check, timeout_ms=timeout):
+            return
+        logging.warning('%s click completed, but page did not advance before fallback timeout.', description)
     except Exception as exc:
         if success_check and await success_check():
             logging.info('%s click timed out, but page already advanced.', description)
@@ -577,12 +688,99 @@ async def click_submit_resiliently(locator, description: str, timeout: int = 800
 
     try:
         await locator.evaluate('(el) => el.click()')
-        logging.info('%s clicked via DOM fallback.', description)
+        if await wait_for_success(success_check, timeout_ms=timeout):
+            logging.info('%s clicked via DOM fallback.', description)
+            return
+        logging.warning('%s DOM click fallback ran, but page still did not advance.', description)
     except Exception as exc:
         if success_check and await success_check():
             logging.info('%s DOM fallback skipped because page already advanced.', description)
             return
         logging.warning(f'{description} DOM click fallback failed: {exc}')
+
+
+async def fill_otp_code(page, auth_input, otp_secret: str) -> str:
+    await wait_for_fresh_totp_window()
+    otp_code = generate_totp(otp_secret)
+    await auth_input.fill('')
+    await auth_input.focus()
+    await auth_input.fill(otp_code)
+
+    try:
+        input_value = await auth_input.input_value(timeout=2000)
+    except Exception:
+        input_value = ''
+
+    if input_value != otp_code:
+        logging.warning('OTP fill verification failed (length=%s). Retrying with DOM assignment...', len(input_value))
+        await auth_input.evaluate(
+            """
+            (el, value) => {
+                el.value = value;
+                el.dispatchEvent(new Event('input', { bubbles: true }));
+                el.dispatchEvent(new Event('change', { bubbles: true }));
+            }
+            """,
+            otp_code,
+        )
+        input_value = await auth_input.input_value(timeout=2000)
+
+    if input_value != otp_code:
+        await capture_diagnostics(page, 'otp_fill_failed')
+        raise RuntimeError(f'Failed to fill OTP input. Expected 6 digits, got length={len(input_value)}.')
+
+    logging.info('OTP code filled successfully (6 digits).')
+    return otp_code
+
+
+async def submit_otp_form_fallback(page) -> bool:
+    return await page.evaluate(
+        """
+        (submitSelector) => {
+            const input = document.querySelector('input[name="auth_code"]');
+            if (!input) return false;
+
+            const submit = document.querySelector(submitSelector);
+            const form = input.form || (submit && submit.form) || input.closest('form');
+            if (!form) {
+                if (submit) {
+                    submit.click();
+                    return true;
+                }
+                return false;
+            }
+
+            if (submit && typeof form.requestSubmit === 'function') {
+                form.requestSubmit(submit);
+            } else if (typeof form.requestSubmit === 'function') {
+                form.requestSubmit();
+            } else {
+                form.submit();
+            }
+            return true;
+        }
+        """,
+        OTP_SUBMIT_DOM_SELECTOR,
+    )
+
+
+async def submit_otp_and_wait(page, submit_button, description: str) -> bool:
+    await click_submit_resiliently(
+        submit_button,
+        description,
+        timeout=7000,
+        success_check=lambda: is_otp_or_dashboard_transition_complete(page),
+    )
+
+    if await is_otp_or_dashboard_transition_complete(page):
+        return True
+
+    logging.info('%s did not advance; submitting OTP form via requestSubmit fallback...', description)
+    submitted = await submit_otp_form_fallback(page)
+    if not submitted:
+        logging.warning('OTP form fallback could not find a form or submit button.')
+
+    return await wait_for_success(lambda: is_otp_or_dashboard_transition_complete(page), timeout_ms=7000)
 
 
 async def is_effectively_enabled(locator) -> bool:
@@ -861,7 +1059,7 @@ async def main():
                     # We catch and log them as warnings to allow the script to proceed.
                     logging.warning(f'Turnstile solve loop exited: {e}')
 
-                await page.wait_for_selector(FINAL_RENEW_BUTTON_SELECTOR, timeout=60000)
+                button = await wait_for_final_renew_button(page, timeout_ms=60000)
                 await page.screenshot(path='before_click.png', full_page=True)
 
                 logging.info('Waiting for final renewal button to become enabled (attempt %s/%s)...', attempt, FINAL_RENEW_ATTEMPTS)
