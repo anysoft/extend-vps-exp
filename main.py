@@ -963,7 +963,7 @@ async def main():
                 raise RuntimeError('Could not find 利用期限 on the server detail page.')
 
             expiry_date = parse_japanese_date(server_info['expiry_date_raw'])
-            renewal_open_date = expiry_date - timedelta(days=1)
+            renewal_open_date = expiry_date - timedelta(hours=12)
             should_renew = renewal_open_date <= today_jst <= expiry_date
             save_local_state(server_info, today_jst)
 
