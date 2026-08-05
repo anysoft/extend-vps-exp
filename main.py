@@ -9,7 +9,7 @@ import sys
 import logging
 import aiohttp
 import time
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
 from urllib.parse import urlparse
@@ -17,6 +17,13 @@ from browserforge.fingerprints import Screen
 from camoufox.async_api import AsyncCamoufox
 from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
 from playwright_captcha.utils.camoufox_add_init_script.add_init_script import get_addon_path
+from renewal_timing import (
+    is_in_renewal_window,
+    now_in_jst,
+    renewal_window_after_success,
+    renewal_window_from_state,
+    should_attempt_login_from_state,
+)
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -114,10 +121,6 @@ def parse_japanese_date(raw: str) -> date:
     return datetime.strptime(normalized, '%Y-%m-%d').date()
 
 
-def today_in_jst() -> date:
-    return datetime.now(ZoneInfo('Asia/Tokyo')).date()
-
-
 def load_local_state() -> dict:
     if not STATE_FILE.exists():
         return {}
@@ -129,13 +132,14 @@ def load_local_state() -> dict:
         return {}
 
 
-def save_local_state(info: dict, today_jst: date):
+def save_local_state(info: dict, today_jst: date, renewed_at_jst: datetime | None = None):
     if not info.get('expiry_date_raw'):
         return
 
     previous = load_local_state()
+    next_expiry_date = parse_japanese_date(info['expiry_date_raw']).isoformat()
     payload = {
-        'next_expiry_date': parse_japanese_date(info['expiry_date_raw']).isoformat(),
+        'next_expiry_date': next_expiry_date,
         'expiry_date_raw': info['expiry_date_raw'],
         'update_date_raw': info.get('update_date_raw', ''),
         'service_code': info.get('service_code', ''),
@@ -147,6 +151,23 @@ def save_local_state(info: dict, today_jst: date):
     for key in ('last_notice_jst', 'last_notice_reason'):
         if previous.get(key):
             payload[key] = previous[key]
+
+    timing_keys = (
+        'last_renewed_at_jst',
+        'renewal_opens_at_jst',
+        'estimated_expiry_at_jst',
+    )
+    if renewed_at_jst is not None:
+        renewal_opens_at, estimated_expiry_at = renewal_window_after_success(renewed_at_jst)
+        payload.update({
+            'last_renewed_at_jst': renewed_at_jst.isoformat(timespec='seconds'),
+            'renewal_opens_at_jst': renewal_opens_at.isoformat(timespec='seconds'),
+            'estimated_expiry_at_jst': estimated_expiry_at.isoformat(timespec='seconds'),
+        })
+    elif previous.get('next_expiry_date') == next_expiry_date:
+        for key in timing_keys:
+            if previous.get(key):
+                payload[key] = previous[key]
 
     STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
     logging.info('Local renewal state updated: %s', payload['next_expiry_date'])
@@ -166,20 +187,6 @@ def should_send_daily_notice(today_jst: date, reason: str) -> bool:
         state.get('last_notice_jst') == today_jst.isoformat()
         and state.get('last_notice_reason') == reason
     )
-
-
-def should_attempt_login_from_state(state: dict, today_jst: date) -> bool:
-    next_expiry = state.get('next_expiry_date')
-    if not next_expiry:
-        return True
-
-    try:
-        expiry_date = datetime.strptime(next_expiry, '%Y-%m-%d').date()
-    except ValueError:
-        return True
-
-    renewal_open_date = expiry_date - timedelta(days=1)
-    return renewal_open_date <= today_jst <= expiry_date
 
 
 def format_server_info_message(prefix: str, info: dict, today_jst: date, should_renew: bool | None = None) -> str:
@@ -886,14 +893,15 @@ async def main():
     notice_tg_userid = os.getenv('NOTICE_TG_USERID', '')
     proxy_server = os.getenv('PROXY_SERVER')
     debug_mode = os.getenv('DEBUG', 'false').lower() == 'true'
-    today_jst = today_in_jst()
+    current_jst = now_in_jst()
+    today_jst = current_jst.date()
     local_state = load_local_state()
 
-    if not should_attempt_login_from_state(local_state, today_jst):
+    if not should_attempt_login_from_state(local_state, current_jst):
         logging.info(
-            'SKIP: Local state says renewal window is not open yet. next_expiry_date=%s today_jst=%s',
+            'SKIP: Local state is outside the 12-hour renewal window. next_expiry_date=%s current_jst=%s',
             local_state.get('next_expiry_date', '-'),
-            today_jst.isoformat(),
+            current_jst.isoformat(timespec='seconds'),
         )
         return
 
@@ -962,23 +970,26 @@ async def main():
             if not server_info['expiry_date_raw']:
                 raise RuntimeError('Could not find 利用期限 on the server detail page.')
 
+            current_jst = now_in_jst()
+            today_jst = current_jst.date()
             expiry_date = parse_japanese_date(server_info['expiry_date_raw'])
-            renewal_open_date = expiry_date - timedelta(hours=12)
-            should_renew = renewal_open_date <= today_jst <= expiry_date
+            renewal_opens_at, expires_at = renewal_window_from_state(local_state, expiry_date)
+            should_renew = is_in_renewal_window(expiry_date, current_jst, local_state)
             save_local_state(server_info, today_jst)
 
             logging.info(
-                'Server detail: service_code=%s expiry=%s last_update=%s today_jst=%s renewal_open_date=%s should_renew=%s',
+                'Server detail: service_code=%s expiry=%s last_update=%s current_jst=%s renewal_opens_at=%s expires_at=%s should_renew=%s',
                 server_info['service_code'] or '-',
                 server_info['expiry_date_raw'],
                 server_info['update_date_raw'] or '-',
-                today_jst.isoformat(),
-                renewal_open_date.isoformat(),
+                current_jst.isoformat(timespec='seconds'),
+                renewal_opens_at.isoformat(timespec='seconds'),
+                expires_at.isoformat(timespec='seconds'),
                 should_renew,
             )
 
             if not should_renew:
-                logging.info('SKIP: Today is outside the renewal window (day before expiry through expiry day).')
+                logging.info('SKIP: Current time is outside the final 12 hours of the expiry date.')
                 notice_reason = 'skip_outside_renewal_window'
                 if should_send_daily_notice(today_jst, notice_reason):
                     await send_tg_notice(
@@ -1086,6 +1097,7 @@ async def main():
                 else:
                     logging.info('Executing final renewal submission...')
                     await button.click(timeout=30000, no_wait_after=True)
+                    renewed_at_jst = now_in_jst()
                     await asyncio.sleep(3)
                     await page.screenshot(path='after_click.png', full_page=True)
                     logging.info('Captured post-click screenshot after 3 seconds.')
@@ -1094,7 +1106,15 @@ async def main():
                     await page.goto(detail_url, wait_until='domcontentloaded', timeout=60000)
                     await page.wait_for_selector('table.table', timeout=30000)
                     latest_server_info = normalize_server_info(await extract_server_info(page))
-                    save_local_state(latest_server_info, today_jst)
+                    if not latest_server_info['expiry_date_raw']:
+                        raise RuntimeError('Renewal submission completed, but the refreshed expiry date is missing.')
+                    latest_expiry_date = parse_japanese_date(latest_server_info['expiry_date_raw'])
+                    if latest_expiry_date <= expiry_date:
+                        raise RuntimeError(
+                            'Renewal submission did not advance the expiry date: '
+                            f'{expiry_date.isoformat()} -> {latest_expiry_date.isoformat()}'
+                        )
+                    save_local_state(latest_server_info, renewed_at_jst.date(), renewed_at_jst)
 
                     logging.info(
                         'Latest detail after renewal: service_code=%s expiry=%s last_update=%s',

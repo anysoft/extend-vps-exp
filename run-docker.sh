@@ -39,6 +39,7 @@ set -e
 
 echo "[3/4] Extracting artifacts..."
 ARTIFACTS=(
+    "renewal_state.json"
     "recording.webm"
     "skip_renewal.png"
     "before_click.png"
