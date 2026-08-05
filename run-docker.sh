@@ -30,8 +30,20 @@ docker run --name "$CONTAINER_NAME" \
     -e PASSWORD="$PASSWORD" \
     -e AUTH_LOGIN_OTP="$AUTH_LOGIN_OTP" \
     -e PROXY_SERVER="$PROXY_SERVER" \
+    -e NOTICE_TG_ENABLED="$NOTICE_TG_ENABLED" \
     -e NOTICE_TG_TOKEN="$NOTICE_TG_TOKEN" \
     -e NOTICE_TG_USERID="$NOTICE_TG_USERID" \
+    -e NOTICE_DINGTALK_ENABLED="$NOTICE_DINGTALK_ENABLED" \
+    -e NOTICE_DINGTALK_WEBHOOK="$NOTICE_DINGTALK_WEBHOOK" \
+    -e NOTICE_DINGTALK_SECRET="$NOTICE_DINGTALK_SECRET" \
+    -e NOTICE_BARK_ENABLED="$NOTICE_BARK_ENABLED" \
+    -e NOTICE_BARK_SERVER="$NOTICE_BARK_SERVER" \
+    -e NOTICE_BARK_DEVICE_KEY="$NOTICE_BARK_DEVICE_KEY" \
+    -e NOTICE_BARK_GROUP="$NOTICE_BARK_GROUP" \
+    -e NOTICE_BARK_SOUND="$NOTICE_BARK_SOUND" \
+    -e NOTICE_LARK_ENABLED="$NOTICE_LARK_ENABLED" \
+    -e NOTICE_LARK_WEBHOOK="$NOTICE_LARK_WEBHOOK" \
+    -e NOTICE_LARK_SECRET="$NOTICE_LARK_SECRET" \
     -e DEBUG="$DEBUG" \
     "$IMAGE_NAME"
 EXIT_CODE=$?
@@ -40,6 +52,7 @@ set -e
 echo "[3/4] Extracting artifacts..."
 ARTIFACTS=(
     "renewal_state.json"
+    "browser_state.json"
     "recording.webm"
     "skip_renewal.png"
     "before_click.png"
@@ -70,7 +83,12 @@ ARTIFACTS=(
 )
 
 # Clean up old local artifacts
-for f in "${ARTIFACTS[@]}"; do rm -f "./$f"; done
+for f in "${ARTIFACTS[@]}"; do
+    case "$f" in
+        renewal_state.json|browser_state.json) continue ;;
+    esac
+    rm -f "./$f"
+done
 
 # Extract files from container
 for f in "${ARTIFACTS[@]}"; do

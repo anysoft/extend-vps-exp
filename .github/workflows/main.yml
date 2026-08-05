@@ -62,7 +62,22 @@ jobs:
         env:
           EMAIL: ${{ secrets.EMAIL }}
           PASSWORD: ${{ secrets.PASSWORD }}
+          AUTH_LOGIN_OTP: ${{ secrets.AUTH_LOGIN_OTP }}
           PROXY_SERVER: ${{ secrets.PROXY_SERVER }}
+          NOTICE_TG_ENABLED: ${{ vars.NOTICE_TG_ENABLED || 'false' }}
+          NOTICE_TG_TOKEN: ${{ secrets.NOTICE_TG_TOKEN }}
+          NOTICE_TG_USERID: ${{ secrets.NOTICE_TG_USERID }}
+          NOTICE_DINGTALK_ENABLED: ${{ vars.NOTICE_DINGTALK_ENABLED || 'false' }}
+          NOTICE_DINGTALK_WEBHOOK: ${{ secrets.NOTICE_DINGTALK_WEBHOOK }}
+          NOTICE_DINGTALK_SECRET: ${{ secrets.NOTICE_DINGTALK_SECRET }}
+          NOTICE_BARK_ENABLED: ${{ vars.NOTICE_BARK_ENABLED || 'false' }}
+          NOTICE_BARK_SERVER: ${{ vars.NOTICE_BARK_SERVER || 'https://api.day.app' }}
+          NOTICE_BARK_DEVICE_KEY: ${{ secrets.NOTICE_BARK_DEVICE_KEY }}
+          NOTICE_BARK_GROUP: ${{ vars.NOTICE_BARK_GROUP || 'XServer VPS' }}
+          NOTICE_BARK_SOUND: ${{ vars.NOTICE_BARK_SOUND }}
+          NOTICE_LARK_ENABLED: ${{ vars.NOTICE_LARK_ENABLED || 'false' }}
+          NOTICE_LARK_WEBHOOK: ${{ secrets.NOTICE_LARK_WEBHOOK }}
+          NOTICE_LARK_SECRET: ${{ secrets.NOTICE_LARK_SECRET }}
           DEBUG: ${{ vars.DEBUG || 'false' }}
           DISPLAY: :99
         run: |

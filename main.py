@@ -12,7 +12,7 @@ import time
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
 from browserforge.fingerprints import Screen
 from camoufox.async_api import AsyncCamoufox
 from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
@@ -28,14 +28,17 @@ from renewal_timing import (
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 STATE_FILE = Path(__file__).resolve().parent / 'renewal_state.json'
+AUTH_STATE_FILE = Path(__file__).resolve().parent / 'browser_state.json'
 DASHBOARD_URL = 'https://secure.xserver.ne.jp/xapanel/xvps/index'
 LOGIN_URL = 'https://secure.xserver.ne.jp/xapanel/login/xvps/'
 OTP_PATH = '/xapanel/myaccount/twostepauth/index'
 OTP_DO_PATH = '/xapanel/myaccount/twostepauth/do'
+AGREEMENT_PATH = '/xapanel/myaccount/agreement/index'
 DASHBOARD_DETAIL_LINK_SELECTOR = 'a[href^="/xapanel/xvps/server/detail?id="]'
 LOGIN_MEMBER_ID_SELECTOR = '#memberid'
 LOGIN_PASSWORD_SELECTOR = '#user_password'
 OTP_INPUT_SELECTOR = 'input[name="auth_code"]'
+OTP_REMEMBER_DEVICE_SELECTOR = 'input[name="remember_device"][value="1"]'
 OTP_SUBMIT_SELECTOR = (
     'input[type="submit"][value="ログイン"], '
     'button:has-text("ログイン"), '
@@ -67,6 +70,18 @@ ENV_KEYS = (
     'PROXY_SERVER',
     'NOTICE_TG_TOKEN',
     'NOTICE_TG_USERID',
+    'NOTICE_TG_ENABLED',
+    'NOTICE_DINGTALK_ENABLED',
+    'NOTICE_DINGTALK_WEBHOOK',
+    'NOTICE_DINGTALK_SECRET',
+    'NOTICE_BARK_ENABLED',
+    'NOTICE_BARK_SERVER',
+    'NOTICE_BARK_DEVICE_KEY',
+    'NOTICE_BARK_GROUP',
+    'NOTICE_BARK_SOUND',
+    'NOTICE_LARK_ENABLED',
+    'NOTICE_LARK_WEBHOOK',
+    'NOTICE_LARK_SECRET',
     'DEBUG',
 )
 
@@ -132,6 +147,57 @@ def load_local_state() -> dict:
         return {}
 
 
+async def create_browser_context(browser):
+    context_options = {'no_viewport': True}
+    if AUTH_STATE_FILE.exists():
+        context_options['storage_state'] = str(AUTH_STATE_FILE)
+
+    try:
+        context = await browser.new_context(**context_options)
+        if 'storage_state' in context_options:
+            logging.info('Loaded saved browser authentication state from %s.', AUTH_STATE_FILE.name)
+        return context
+    except Exception as exc:
+        if 'storage_state' not in context_options:
+            raise
+        logging.warning('Saved browser authentication state could not be loaded; using a fresh context: %s', exc)
+        return await browser.new_context(no_viewport=True)
+
+
+async def save_browser_auth_state(context):
+    try:
+        browser_state = await context.storage_state()
+        current_epoch = time.time()
+        trusted_device_cookies = [
+            cookie
+            for cookie in browser_state.get('cookies', [])
+            if (
+                cookie.get('domain', '').lstrip('.').lower() == 'xserver.ne.jp'
+                or cookie.get('domain', '').lstrip('.').lower().endswith('.xserver.ne.jp')
+            )
+            and isinstance(cookie.get('expires'), (int, float))
+            and cookie['expires'] > current_epoch
+        ]
+        trusted_device_state = {
+            'cookies': trusted_device_cookies,
+            'origins': [],
+        }
+        temp_state_file = AUTH_STATE_FILE.with_suffix('.tmp')
+        temp_state_file.write_text(
+            json.dumps(trusted_device_state, ensure_ascii=False, indent=2),
+            encoding='utf-8',
+        )
+        temp_state_file.chmod(0o600)
+        temp_state_file.replace(AUTH_STATE_FILE)
+        logging.info(
+            'Saved %s persistent XServer trusted-device cookie(s) to %s.',
+            len(trusted_device_cookies),
+            AUTH_STATE_FILE.name,
+        )
+    except Exception as exc:
+        logging.warning('Could not save trusted-device browser state: %s', exc)
+
+
 def save_local_state(info: dict, today_jst: date, renewed_at_jst: datetime | None = None):
     if not info.get('expiry_date_raw'):
         return
@@ -193,26 +259,34 @@ def format_server_info_message(prefix: str, info: dict, today_jst: date, should_
     lines = [prefix]
 
     if info.get('server_name'):
-        lines.append(f"server: {info['server_name']}")
+        lines.append(f"服务器: {info['server_name']}")
     if info.get('service_code'):
-        lines.append(f"service_code: {info['service_code']}")
+        lines.append(f"服务代码: {info['service_code']}")
     if info.get('uuid'):
-        lines.append(f"uuid: {info['uuid']}")
+        lines.append(f"UUID: {info['uuid']}")
     if info.get('expiry_date_raw'):
-        lines.append(f"expiry: {info['expiry_date_raw']}")
+        lines.append(f"到期时间: {info['expiry_date_raw']}")
     if info.get('update_date_raw'):
-        lines.append(f"last_update: {info['update_date_raw']}")
+        lines.append(f"上次更新: {info['update_date_raw']}")
 
-    lines.append(f"today_jst: {today_jst.isoformat()}")
+    lines.append(f"日本日期: {today_jst.isoformat()}")
     if should_renew is not None:
-        lines.append(f"should_renew: {should_renew}")
+        lines.append(f"处于续期窗口: {'是' if should_renew else '否'}")
 
     return '\n'.join(lines)
 
 
-async def send_tg_notice(token: str, user_id: str, message: str):
+def env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    return value.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+async def send_telegram_notice(token: str, user_id: str, message: str) -> bool:
     if not token or not user_id:
-        return
+        logging.warning('Telegram notification is enabled but token or user ID is missing.')
+        return False
 
     url = f'https://api.telegram.org/bot{token}/sendMessage'
     payload = {
@@ -221,13 +295,214 @@ async def send_tg_notice(token: str, user_id: str, message: str):
     }
 
     try:
-        async with aiohttp.ClientSession() as session:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
             async with session.post(url, json=payload) as resp:
                 if resp.status >= 400:
                     body = await resp.text()
-                    logging.warning(f'Telegram notice failed: {resp.status} {body}')
+                    logging.warning('Telegram notification failed: HTTP %s %s', resp.status, body)
+                    return False
+                logging.info('Telegram notification sent successfully.')
+                return True
     except Exception as exc:
-        logging.warning(f'Telegram notice raised an exception: {exc}')
+        logging.warning('Telegram notification raised an exception: %s', exc)
+        return False
+
+
+def build_dingtalk_webhook(webhook: str, secret: str, timestamp_ms: int | None = None) -> str:
+    if not secret:
+        return webhook
+
+    timestamp_ms = timestamp_ms or int(time.time() * 1000)
+    string_to_sign = f'{timestamp_ms}\n{secret}'.encode('utf-8')
+    signature = base64.b64encode(
+        hmac.new(secret.encode('utf-8'), string_to_sign, hashlib.sha256).digest()
+    ).decode('utf-8')
+    parsed = urlparse(webhook)
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    query.update({'timestamp': str(timestamp_ms), 'sign': signature})
+    return urlunparse(parsed._replace(query=urlencode(query)))
+
+
+async def send_dingtalk_notice(webhook: str, secret: str, message: str) -> bool:
+    if not webhook:
+        logging.warning('DingTalk notification is enabled but webhook is missing.')
+        return False
+
+    url = build_dingtalk_webhook(webhook, secret)
+    payload = {
+        'msgtype': 'text',
+        'text': {'content': message},
+    }
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.post(url, json=payload) as resp:
+                body = await resp.text()
+                if resp.status >= 400:
+                    logging.warning('DingTalk notification failed: HTTP %s %s', resp.status, body)
+                    return False
+                try:
+                    result = json.loads(body)
+                except json.JSONDecodeError:
+                    result = {}
+                if result.get('errcode', 0) != 0:
+                    logging.warning('DingTalk notification rejected: %s', body)
+                    return False
+                logging.info('DingTalk notification sent successfully.')
+                return True
+    except Exception as exc:
+        logging.warning('DingTalk notification raised an exception: %s', exc)
+        return False
+
+
+async def send_bark_notice(
+    server: str,
+    device_key: str,
+    message: str,
+    group: str = 'XServer VPS',
+    sound: str = '',
+) -> bool:
+    if not device_key:
+        logging.warning('Bark notification is enabled but device key is missing.')
+        return False
+
+    endpoint = (server or 'https://api.day.app').rstrip('/')
+    if not endpoint.endswith('/push'):
+        endpoint += '/push'
+
+    message_lines = message.splitlines()
+    title = message_lines[0] if message_lines else 'XServer VPS 通知'
+    body = '\n'.join(message_lines[1:]) or title
+    payload = {
+        'device_key': device_key,
+        'title': title,
+        'body': body,
+        'group': group or 'XServer VPS',
+    }
+    if sound:
+        payload['sound'] = sound
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.post(endpoint, json=payload) as resp:
+                response_body = await resp.text()
+                if resp.status >= 400:
+                    logging.warning('Bark notification failed: HTTP %s %s', resp.status, response_body)
+                    return False
+                try:
+                    result = json.loads(response_body)
+                except json.JSONDecodeError:
+                    result = {}
+                if result.get('code', 200) != 200:
+                    logging.warning('Bark notification rejected: %s', response_body)
+                    return False
+                logging.info('Bark notification sent successfully.')
+                return True
+    except Exception as exc:
+        logging.warning('Bark notification raised an exception: %s', exc)
+        return False
+
+
+def build_lark_signature(secret: str, timestamp: int) -> str:
+    string_to_sign = f'{timestamp}\n{secret}'.encode('utf-8')
+    signature = hmac.new(string_to_sign, digestmod=hashlib.sha256).digest()
+    return base64.b64encode(signature).decode('utf-8')
+
+
+async def send_lark_notice(webhook: str, secret: str, message: str) -> bool:
+    if not webhook:
+        logging.warning('Lark notification is enabled but webhook is missing.')
+        return False
+
+    payload = {
+        'msg_type': 'text',
+        'content': {'text': message},
+    }
+    if secret:
+        timestamp = int(time.time())
+        payload.update({
+            'timestamp': str(timestamp),
+            'sign': build_lark_signature(secret, timestamp),
+        })
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
+            async with session.post(webhook, json=payload) as resp:
+                body = await resp.text()
+                if resp.status >= 400:
+                    logging.warning('Lark notification failed: HTTP %s %s', resp.status, body)
+                    return False
+                try:
+                    result = json.loads(body)
+                except json.JSONDecodeError:
+                    result = {}
+                result_code = result.get('code', result.get('StatusCode', 0))
+                if result_code != 0:
+                    logging.warning('Lark notification rejected: %s', body)
+                    return False
+                logging.info('Lark notification sent successfully.')
+                return True
+    except Exception as exc:
+        logging.warning('Lark notification raised an exception: %s', exc)
+        return False
+
+
+async def send_notice(message: str) -> dict[str, bool]:
+    """Send enabled notifications serially: Telegram, DingTalk, Bark, then Lark."""
+    tg_token = os.getenv('NOTICE_TG_TOKEN', '')
+    tg_user_id = os.getenv('NOTICE_TG_USERID', '')
+    channels = [
+        (
+            'telegram',
+            env_flag('NOTICE_TG_ENABLED', default=bool(tg_token and tg_user_id)),
+            lambda: send_telegram_notice(tg_token, tg_user_id, message),
+        ),
+        (
+            'dingtalk',
+            env_flag('NOTICE_DINGTALK_ENABLED'),
+            lambda: send_dingtalk_notice(
+                os.getenv('NOTICE_DINGTALK_WEBHOOK', ''),
+                os.getenv('NOTICE_DINGTALK_SECRET', ''),
+                message,
+            ),
+        ),
+        (
+            'bark',
+            env_flag('NOTICE_BARK_ENABLED'),
+            lambda: send_bark_notice(
+                os.getenv('NOTICE_BARK_SERVER', 'https://api.day.app'),
+                os.getenv('NOTICE_BARK_DEVICE_KEY', ''),
+                message,
+                os.getenv('NOTICE_BARK_GROUP', 'XServer VPS'),
+                os.getenv('NOTICE_BARK_SOUND', ''),
+            ),
+        ),
+        (
+            'lark',
+            env_flag('NOTICE_LARK_ENABLED'),
+            lambda: send_lark_notice(
+                os.getenv('NOTICE_LARK_WEBHOOK', ''),
+                os.getenv('NOTICE_LARK_SECRET', ''),
+                message,
+            ),
+        ),
+    ]
+
+    results = {}
+    for channel_name, enabled, sender in channels:
+        if not enabled:
+            continue
+        try:
+            results[channel_name] = await sender()
+        except Exception as exc:
+            logging.warning('%s notification failed unexpectedly: %s', channel_name, exc)
+            results[channel_name] = False
+    return results
+
+
+async def send_tg_notice(token: str, user_id: str, message: str) -> bool:
+    """Backward-compatible Telegram-only wrapper."""
+    return await send_telegram_notice(token, user_id, message)
 
 
 async def extract_server_info(page) -> dict:
@@ -302,6 +577,8 @@ async def detect_login_state(page) -> str:
 
     if await safe_is_visible(page.locator(DASHBOARD_DETAIL_LINK_SELECTOR)):
         return 'dashboard'
+    if AGREEMENT_PATH in current_url:
+        return 'agreement'
     if OTP_DO_PATH in current_url:
         return 'otp_submitted'
     if await safe_is_visible(page.locator(OTP_INPUT_SELECTOR)):
@@ -327,7 +604,7 @@ async def wait_for_login_entry_state(page, timeout_ms: int = 45000) -> str:
             logging.info('Login entry state: %s url=%s', state, page.url)
             last_logged_state = state
 
-        if state in ('login_form', 'otp_form', 'otp_submitted', 'dashboard', 'xvps_area'):
+        if state in ('login_form', 'otp_form', 'otp_submitted', 'agreement', 'dashboard', 'xvps_area'):
             return state
 
         await asyncio.sleep(0.5)
@@ -346,7 +623,7 @@ async def wait_for_otp_state(page, timeout_ms: int = 45000) -> str:
             logging.info('OTP wait state: %s url=%s', state, page.url)
             last_logged_state = state
 
-        if state in ('otp_form', 'otp_submitted', 'dashboard', 'xvps_area', 'login_form'):
+        if state in ('otp_form', 'otp_submitted', 'agreement', 'dashboard', 'xvps_area', 'login_form'):
             return state
 
         await asyncio.sleep(0.5)
@@ -501,10 +778,62 @@ async def wait_for_final_renew_button(page, timeout_ms: int = 60000):
     raise TimeoutError(f'Timed out waiting for final renewal button. Last state: {last_logged_state}. url={page.url}')
 
 
+async def redirect_agreement_to_dashboard(page) -> bool:
+    if AGREEMENT_PATH not in page.url:
+        return False
+
+    logging.info('Agreement page detected after login. Opening XVPS dashboard directly...')
+    await page.goto(DASHBOARD_URL, wait_until='domcontentloaded', timeout=60000)
+    return True
+
+
+async def enable_otp_remember_device(page) -> bool:
+    checkbox = page.locator(OTP_REMEMBER_DEVICE_SELECTOR).first
+
+    try:
+        await checkbox.wait_for(state='attached', timeout=3000)
+    except Exception:
+        logging.warning('OTP trusted-device checkbox was not found; continuing without 30-day trust.')
+        return False
+
+    try:
+        if not await checkbox.is_checked():
+            await checkbox.check(force=True, timeout=3000)
+    except Exception as exc:
+        logging.warning('Could not check trusted-device option normally; trying DOM fallback: %s', exc)
+        try:
+            await checkbox.evaluate(
+                """
+                el => {
+                    el.checked = true;
+                    el.dispatchEvent(new Event('input', { bubbles: true }));
+                    el.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+                """
+            )
+        except Exception as fallback_exc:
+            logging.warning('Trusted-device DOM fallback failed: %s', fallback_exc)
+            return False
+
+    try:
+        is_checked = await checkbox.is_checked()
+    except Exception:
+        is_checked = False
+
+    if is_checked:
+        logging.info('Enabled OTP trusted-device option for 30 days.')
+        return True
+
+    logging.warning('OTP trusted-device checkbox did not remain checked.')
+    return False
+
+
 async def complete_optional_otp(page, otp_secret: str):
     for _ in range(60):
         current_url = page.url
         if '/xapanel/xvps/' in current_url:
+            return
+        if await redirect_agreement_to_dashboard(page):
             return
         if OTP_PATH in current_url or OTP_DO_PATH in current_url:
             await submit_otp_with_retries(page, otp_secret)
@@ -524,6 +853,10 @@ async def submit_otp_with_retries(page, otp_secret: str, max_attempts: int = 3):
         if state in ('dashboard', 'xvps_area'):
             return
 
+        if state == 'agreement':
+            await redirect_agreement_to_dashboard(page)
+            return
+
         if state == 'otp_submitted' or OTP_DO_PATH in page.url:
             logging.info('OTP submit endpoint is still open. Trying dashboard URL directly...')
             await page.goto(DASHBOARD_URL, wait_until='domcontentloaded', timeout=60000)
@@ -538,12 +871,16 @@ async def submit_otp_with_retries(page, otp_secret: str, max_attempts: int = 3):
         submit_button = page.locator(OTP_SUBMIT_SELECTOR).first
         error_message = page.locator('text="認証コードが一致しません"')
         await fill_otp_code(page, auth_input, otp_secret)
+        await enable_otp_remember_device(page)
         await submit_otp_and_wait(page, submit_button, 'OTP login button')
 
         retried_click = False
         for _ in range(30):
             current_url = page.url
             if '/xapanel/xvps/' in current_url:
+                return
+
+            if await redirect_agreement_to_dashboard(page):
                 return
 
             if OTP_DO_PATH in current_url:
@@ -572,6 +909,7 @@ async def submit_otp_with_retries(page, otp_secret: str, max_attempts: int = 3):
             if not retried_click:
                 logging.info('OTP page is still open; refilling a fresh code and retrying submit once more...')
                 await fill_otp_code(page, auth_input, otp_secret)
+                await enable_otp_remember_device(page)
                 await submit_otp_and_wait(page, submit_button, 'OTP login button retry')
                 retried_click = True
                 if await is_otp_or_dashboard_transition_complete(page):
@@ -616,6 +954,11 @@ async def ensure_dashboard_loaded(page, otp_secret: str, email: str, password: s
         except Exception:
             pass
 
+        if AGREEMENT_PATH in current_url and can_force_dashboard:
+            await redirect_agreement_to_dashboard(page)
+            last_forced_dashboard_visit = time.time()
+            continue
+
         if OTP_PATH in current_url or await safe_is_visible(page.locator(OTP_INPUT_SELECTOR)):
             await submit_otp_with_retries(page, otp_secret)
             continue
@@ -639,7 +982,12 @@ async def ensure_dashboard_loaded(page, otp_secret: str, email: str, password: s
                 last_forced_dashboard_visit = time.time()
                 continue
             except Exception as exc:
-                if OTP_PATH in page.url or OTP_DO_PATH in page.url or '/xapanel/xvps/' in page.url:
+                if (
+                    OTP_PATH in page.url
+                    or OTP_DO_PATH in page.url
+                    or AGREEMENT_PATH in page.url
+                    or '/xapanel/xvps/' in page.url
+                ):
                     logging.info('Login resubmit moved to %s; continuing recovery.', page.url)
                     continue
                 logging.warning(f'Login resubmit did not finish cleanly: {exc}')
@@ -660,13 +1008,18 @@ async def is_login_transition_started(page) -> bool:
     return (
         OTP_PATH in current_url
         or OTP_DO_PATH in current_url
+        or AGREEMENT_PATH in current_url
         or '/xapanel/xvps/' in current_url
     )
 
 
 async def is_otp_or_dashboard_transition_complete(page) -> bool:
     current_url = page.url
-    return OTP_DO_PATH in current_url or '/xapanel/xvps/' in current_url
+    return (
+        OTP_DO_PATH in current_url
+        or AGREEMENT_PATH in current_url
+        or '/xapanel/xvps/' in current_url
+    )
 
 
 async def wait_for_success(success_check, timeout_ms: int = 5000, poll_ms: int = 250) -> bool:
@@ -889,8 +1242,6 @@ async def main():
     email = os.getenv('EMAIL', '')
     password = os.getenv('PASSWORD', '')
     auth_login_otp = os.getenv('AUTH_LOGIN_OTP', '')
-    notice_tg_token = os.getenv('NOTICE_TG_TOKEN', '')
-    notice_tg_userid = os.getenv('NOTICE_TG_USERID', '')
     proxy_server = os.getenv('PROXY_SERVER')
     debug_mode = os.getenv('DEBUG', 'false').lower() == 'true'
     current_jst = now_in_jst()
@@ -933,9 +1284,7 @@ async def main():
     
     logging.info('Launching Camoufox in Python...')
     async with AsyncCamoufox(**options) as browser:
-        context = await browser.new_context(
-            no_viewport=True,
-        )
+        context = await create_browser_context(browser)
         page = await context.new_page()
         #context = await browser.new_context()
         #page = await context.new_page()
@@ -955,6 +1304,7 @@ async def main():
 
             logging.info('Ensuring dashboard is fully reachable...')
             await ensure_dashboard_loaded(page, auth_login_otp, email, password)
+            await save_browser_auth_state(context)
             await close_free_user_campaign_modal(page)
 
             logging.info('Navigating server details...')
@@ -992,14 +1342,20 @@ async def main():
                 logging.info('SKIP: Current time is outside the final 12 hours of the expiry date.')
                 notice_reason = 'skip_outside_renewal_window'
                 if should_send_daily_notice(today_jst, notice_reason):
-                    await send_tg_notice(
-                        notice_tg_token,
-                        notice_tg_userid,
-                        format_server_info_message('XServer VPS renewal skipped.', server_info, today_jst, should_renew=False),
+                    notice_results = await send_notice(
+                        format_server_info_message(
+                            '⚠️ XServer VPS 暂未续期：当前不在 12 小时续期窗口',
+                            server_info,
+                            today_jst,
+                            should_renew=False,
+                        )
                     )
-                    mark_notice_sent(today_jst, notice_reason)
+                    if any(notice_results.values()):
+                        mark_notice_sent(today_jst, notice_reason)
+                    else:
+                        logging.warning('No enabled notification channel delivered the skip notice.')
                 else:
-                    logging.info('SKIP: Daily Telegram notice already sent for %s.', notice_reason)
+                    logging.info('SKIP: Daily notification already sent for %s.', notice_reason)
                 await page.screenshot(path='skip_renewal.png', full_page=True)
                 return
 
@@ -1011,17 +1367,23 @@ async def main():
             # If the suspension notice is visible, skip renewal gracefully
             if renewal_state == 'suspended':
                 logging.info('SKIP: Renewal is not yet available (detected .newApp__suspended).')
-                logging.info('XServer: "利用期限の1日前から更新手続きが可能です。"')
+                logging.info('XServer renewal is available only during the final 12 hours.')
                 notice_reason = 'skip_not_yet_available'
                 if should_send_daily_notice(today_jst, notice_reason):
-                    await send_tg_notice(
-                        notice_tg_token,
-                        notice_tg_userid,
-                        format_server_info_message('XServer VPS renewal skipped: not yet available.', server_info, today_jst, should_renew=True),
+                    notice_results = await send_notice(
+                        format_server_info_message(
+                            '⚠️ XServer VPS 暂未续期：续期入口尚未开放',
+                            server_info,
+                            today_jst,
+                            should_renew=True,
+                        )
                     )
-                    mark_notice_sent(today_jst, notice_reason)
+                    if any(notice_results.values()):
+                        mark_notice_sent(today_jst, notice_reason)
+                    else:
+                        logging.warning('No enabled notification channel delivered the skip notice.')
                 else:
-                    logging.info('SKIP: Daily Telegram notice already sent for %s.', notice_reason)
+                    logging.info('SKIP: Daily notification already sent for %s.', notice_reason)
                 await page.screenshot(path='skip_renewal.png', full_page=True)
                 return
 
@@ -1086,13 +1448,24 @@ async def main():
                 logging.error(err_msg)
                 if not debug_mode:
                     raise Exception(err_msg)
+                await send_notice(
+                    format_server_info_message(
+                        f'❌ XServer VPS 续期检查失败（DEBUG 模式）\n失败原因: {err_msg}',
+                        server_info,
+                        today_jst,
+                        should_renew=True,
+                    )
+                )
             else:
                 if debug_mode:
                     logging.info('DEBUG MODE: Final button is ENABLED. Skipping final click to preserve daily limit.')
-                    await send_tg_notice(
-                        notice_tg_token,
-                        notice_tg_userid,
-                        format_server_info_message('XServer VPS renewal ready in debug mode.', server_info, today_jst, should_renew=True),
+                    await send_notice(
+                        format_server_info_message(
+                            '✅ XServer VPS 续期检查通过（DEBUG 模式，未提交）',
+                            server_info,
+                            today_jst,
+                            should_renew=True,
+                        )
                     )
                 else:
                     logging.info('Executing final renewal submission...')
@@ -1122,13 +1495,11 @@ async def main():
                         latest_server_info['expiry_date_raw'] or '-',
                         latest_server_info['update_date_raw'] or '-',
                     )
-                    await send_tg_notice(
-                        notice_tg_token,
-                        notice_tg_userid,
+                    await send_notice(
                         format_server_info_message(
-                            'XServer VPS renewal submitted successfully.',
+                            '✅ XServer VPS 续期成功',
                             latest_server_info,
-                            today_jst,
+                            renewed_at_jst.date(),
                             should_renew=True,
                         ),
                     )
@@ -1144,10 +1515,10 @@ async def main():
             await capture_diagnostics(page, 'failure')
             try:
                 today_jst = datetime.now(ZoneInfo('Asia/Tokyo')).date()
-                await send_tg_notice(
-                    notice_tg_token,
-                    notice_tg_userid,
-                    f'XServer VPS renewal failed.\nerror: {e}\ntoday_jst: {today_jst.isoformat()}',
+                await send_notice(
+                    '❌ XServer VPS 续期失败\n'
+                    f'失败原因: {e}\n'
+                    f'日本日期: {today_jst.isoformat()}',
                 )
             except Exception:
                 pass
@@ -1156,19 +1527,11 @@ async def main():
             await asyncio.sleep(2)
             await context.close()
 
-async def test_tg():
-    email = os.getenv('EMAIL', '')
-    password = os.getenv('PASSWORD', '')
-    auth_login_otp = os.getenv('AUTH_LOGIN_OTP', '')
-    notice_tg_token = os.getenv('NOTICE_TG_TOKEN', '')
-    notice_tg_userid = os.getenv('NOTICE_TG_USERID', '')
-    proxy_server = os.getenv('PROXY_SERVER')
-    debug_mode = os.getenv('DEBUG', 'false').lower() == 'true'
-    await send_tg_notice(
-                    notice_tg_token,
-                    notice_tg_userid,
-                    'XServer VPS tg test',
-                )
+async def test_notice():
+    load_local_env()
+    await send_notice('✅ XServer VPS 通知测试成功')
+
+
 if __name__ == '__main__':
     asyncio.run(main())
-    # asyncio.run(test_tg())
+    # asyncio.run(test_notice())

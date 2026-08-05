@@ -22,10 +22,24 @@ EMAIL=your@gmail.com
 PASSWORD=yourpassword
 AUTH_LOGIN_OTP=your_base32_totp_secret
 PROXY_SERVER=http://user:password@example.com:8888
+NOTICE_TG_ENABLED=true
 NOTICE_TG_TOKEN=telegram_bot_token
 NOTICE_TG_USERID=telegram_chat_id
+NOTICE_DINGTALK_ENABLED=false
+NOTICE_DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=your_token
+NOTICE_DINGTALK_SECRET=your_signing_secret
+NOTICE_BARK_ENABLED=false
+NOTICE_BARK_SERVER=https://api.day.app
+NOTICE_BARK_DEVICE_KEY=your_device_key
+NOTICE_BARK_GROUP=XServer-VPS
+NOTICE_BARK_SOUND=
+NOTICE_LARK_ENABLED=false
+NOTICE_LARK_WEBHOOK=https://open.larksuite.com/open-apis/bot/v2/hook/your_hook
+NOTICE_LARK_SECRET=your_signing_secret
 DEBUG=true \
 ```
+
+通知渠道按 Telegram → 钉钉 → Bark → Lark 的顺序串行发送。单个渠道发送失败不会阻断后续渠道；将对应的 `NOTICE_*_ENABLED` 设置为 `true` 即可启用。
 
 <details><summary>安装代理服务器</summary>
 

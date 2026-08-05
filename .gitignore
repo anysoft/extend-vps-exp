@@ -16,3 +16,4 @@ skip_renewal.png
 .python-version 
 install.sh 
 renewal_state.json
+browser_state.json
