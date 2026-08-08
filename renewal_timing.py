@@ -6,7 +6,6 @@ from zoneinfo import ZoneInfo
 
 JST = ZoneInfo('Asia/Tokyo')
 RENEWAL_WINDOW = timedelta(hours=12)
-RENEWAL_PERIOD = timedelta(hours=24)
 
 
 def now_in_jst() -> datetime:
@@ -14,37 +13,20 @@ def now_in_jst() -> datetime:
 
 
 def renewal_window_for_expiry_date(expiry_date: date) -> tuple[datetime, datetime]:
-    """Return a fallback window when an old state has only an expiry date.
+    """Return the final 12 hours of the displayed XServer expiry date.
 
-    XServer exposes the expiry as a calendar date without a time. Treat the
-    service as valid through that date, so its exclusive deadline is midnight
-    at the start of the following day in Japan. New state files use precise
-    timestamps recorded after a successful renewal instead.
+    XServer exposes the expiry as a calendar date without a time. The renewal
+    window is therefore 12:00 through 24:00 JST on that date. Do not infer it
+    from the previous renewal time; that caused premature logins around
+    midnight when the actual renewal controls were still unavailable.
     """
     expires_at = datetime.combine(expiry_date + timedelta(days=1), time.min, tzinfo=JST)
     return expires_at - RENEWAL_WINDOW, expires_at
 
 
-def renewal_window_after_success(renewed_at_jst: datetime) -> tuple[datetime, datetime]:
-    renewed_at = _as_jst(renewed_at_jst)
-    return renewed_at + RENEWAL_WINDOW, renewed_at + RENEWAL_PERIOD
-
-
-def renewal_window_from_state(state: dict, expiry_date: date) -> tuple[datetime, datetime]:
-    try:
-        renewal_opens_at = _parse_state_datetime(state.get('renewal_opens_at_jst'))
-        expires_at = _parse_state_datetime(state.get('estimated_expiry_at_jst'))
-        state_expiry_date = datetime.strptime(state.get('next_expiry_date', ''), '%Y-%m-%d').date()
-    except (TypeError, ValueError):
-        return renewal_window_for_expiry_date(expiry_date)
-
-    if (
-        renewal_opens_at < expires_at
-        and state_expiry_date == expiry_date
-        and expires_at.date() == expiry_date
-    ):
-        return renewal_opens_at, expires_at
-
+def renewal_window_from_state(_state: dict, expiry_date: date) -> tuple[datetime, datetime]:
+    # Keep this wrapper for callers that still pass state, but deliberately
+    # ignore legacy inferred timestamps such as renewal_opens_at_jst.
     return renewal_window_for_expiry_date(expiry_date)
 
 
@@ -76,9 +58,3 @@ def _as_jst(value: datetime) -> datetime:
     if value.tzinfo is None:
         return value.replace(tzinfo=JST)
     return value.astimezone(JST)
-
-
-def _parse_state_datetime(value: str | None) -> datetime:
-    if not value:
-        raise ValueError('missing state datetime')
-    return _as_jst(datetime.fromisoformat(value.replace('Z', '+00:00')))

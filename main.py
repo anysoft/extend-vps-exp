@@ -12,7 +12,7 @@ import time
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 from pathlib import Path
-from urllib.parse import parse_qsl, urlencode, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 from browserforge.fingerprints import Screen
 from camoufox.async_api import AsyncCamoufox
 from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
@@ -20,7 +20,6 @@ from playwright_captcha.utils.camoufox_add_init_script.add_init_script import ge
 from renewal_timing import (
     is_in_renewal_window,
     now_in_jst,
-    renewal_window_after_success,
     renewal_window_from_state,
     should_attempt_login_from_state,
 )
@@ -198,7 +197,7 @@ async def save_browser_auth_state(context):
         logging.warning('Could not save trusted-device browser state: %s', exc)
 
 
-def save_local_state(info: dict, today_jst: date, renewed_at_jst: datetime | None = None):
+def save_local_state(info: dict, today_jst: date):
     if not info.get('expiry_date_raw'):
         return
 
@@ -217,23 +216,6 @@ def save_local_state(info: dict, today_jst: date, renewed_at_jst: datetime | Non
     for key in ('last_notice_jst', 'last_notice_reason'):
         if previous.get(key):
             payload[key] = previous[key]
-
-    timing_keys = (
-        'last_renewed_at_jst',
-        'renewal_opens_at_jst',
-        'estimated_expiry_at_jst',
-    )
-    if renewed_at_jst is not None:
-        renewal_opens_at, estimated_expiry_at = renewal_window_after_success(renewed_at_jst)
-        payload.update({
-            'last_renewed_at_jst': renewed_at_jst.isoformat(timespec='seconds'),
-            'renewal_opens_at_jst': renewal_opens_at.isoformat(timespec='seconds'),
-            'estimated_expiry_at_jst': estimated_expiry_at.isoformat(timespec='seconds'),
-        })
-    elif previous.get('next_expiry_date') == next_expiry_date:
-        for key in timing_keys:
-            if previous.get(key):
-                payload[key] = previous[key]
 
     STATE_FILE.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding='utf-8')
     logging.info('Local renewal state updated: %s', payload['next_expiry_date'])
@@ -274,6 +256,14 @@ def format_server_info_message(prefix: str, info: dict, today_jst: date, should_
         lines.append(f"处于续期窗口: {'是' if should_renew else '否'}")
 
     return '\n'.join(lines)
+
+
+def summarize_error_for_notice(exc: Exception, max_length: int = 300) -> str:
+    first_line = next((line.strip() for line in str(exc).splitlines() if line.strip()), '')
+    summary = first_line or exc.__class__.__name__
+    if len(summary) > max_length:
+        return summary[:max_length - 1] + '…'
+    return summary
 
 
 def env_flag(name: str, default: bool = False) -> bool:
@@ -1308,7 +1298,15 @@ async def main():
             await close_free_user_campaign_modal(page)
 
             logging.info('Navigating server details...')
-            await page.locator(DASHBOARD_DETAIL_LINK_SELECTOR).first.click(no_wait_after=True)
+            detail_link = page.locator(DASHBOARD_DETAIL_LINK_SELECTOR).first
+            detail_href = await detail_link.get_attribute('href', timeout=5000)
+            if not detail_href:
+                raise RuntimeError('Could not read the server detail link URL.')
+            await page.goto(
+                urljoin(DASHBOARD_URL, detail_href),
+                wait_until='domcontentloaded',
+                timeout=60000,
+            )
             
             logging.info('Waiting for server detail page...')
             await page.wait_for_selector('text="更新する"', timeout=30000)
@@ -1487,7 +1485,7 @@ async def main():
                             'Renewal submission did not advance the expiry date: '
                             f'{expiry_date.isoformat()} -> {latest_expiry_date.isoformat()}'
                         )
-                    save_local_state(latest_server_info, renewed_at_jst.date(), renewed_at_jst)
+                    save_local_state(latest_server_info, renewed_at_jst.date())
 
                     logging.info(
                         'Latest detail after renewal: service_code=%s expiry=%s last_update=%s',
@@ -1517,7 +1515,7 @@ async def main():
                 today_jst = datetime.now(ZoneInfo('Asia/Tokyo')).date()
                 await send_notice(
                     '❌ XServer VPS 续期失败\n'
-                    f'失败原因: {e}\n'
+                    f'失败原因: {summarize_error_for_notice(e)}\n'
                     f'日本日期: {today_jst.isoformat()}',
                 )
             except Exception:

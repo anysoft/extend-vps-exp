@@ -1,7 +1,7 @@
 import unittest
 from datetime import datetime
 
-from renewal_timing import JST, renewal_window_after_success, should_attempt_login_from_state
+from renewal_timing import JST, should_attempt_login_from_state
 
 
 class ShouldAttemptLoginFromStateTests(unittest.TestCase):
@@ -32,23 +32,16 @@ class ShouldAttemptLoginFromStateTests(unittest.TestCase):
             should_attempt_login_from_state({'next_expiry_date': 'invalid'}, self.at(26, 18))
         )
 
-    def test_precise_window_recorded_after_renewal_takes_priority(self):
+    def test_legacy_inferred_timestamps_are_ignored(self):
         state = {
             'next_expiry_date': '2026-07-27',
             'renewal_opens_at_jst': '2026-07-27T06:34:00+09:00',
             'estimated_expiry_at_jst': '2026-07-27T18:34:00+09:00',
         }
 
-        self.assertFalse(should_attempt_login_from_state(state, self.at(27, 6, 33)))
-        self.assertTrue(should_attempt_login_from_state(state, self.at(27, 6, 34)))
-        self.assertTrue(should_attempt_login_from_state(state, self.at(27, 18, 33)))
-        self.assertFalse(should_attempt_login_from_state(state, self.at(27, 18, 34)))
-
-    def test_successful_renewal_creates_twelve_to_twenty_four_hour_window(self):
-        opens_at, expires_at = renewal_window_after_success(self.at(26, 18, 34))
-
-        self.assertEqual(opens_at, self.at(27, 6, 34))
-        self.assertEqual(expires_at, self.at(27, 18, 34))
+        self.assertFalse(should_attempt_login_from_state(state, self.at(27, 6, 34)))
+        self.assertFalse(should_attempt_login_from_state(state, self.at(27, 11, 59)))
+        self.assertTrue(should_attempt_login_from_state(state, self.at(27, 12, 0)))
 
 
 if __name__ == '__main__':

@@ -100,6 +100,14 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
             'l1N0gAcBjdwBvGm1xMjOF0XSyaLRpR7tuO5dHfhAYc8=',
         )
 
+    def test_error_notice_uses_only_the_first_line(self):
+        error = RuntimeError('Locator.click: Timeout 30000ms exceeded.\nCall log:\n- waiting')
+
+        self.assertEqual(
+            main.summarize_error_for_notice(error),
+            'Locator.click: Timeout 30000ms exceeded.',
+        )
+
 
 if __name__ == '__main__':
     unittest.main()
