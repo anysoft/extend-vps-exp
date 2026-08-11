@@ -30,7 +30,7 @@ NOTICE_DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=your_t
 NOTICE_DINGTALK_SECRET=your_signing_secret
 NOTICE_BARK_ENABLED=false
 NOTICE_BARK_SERVER=https://api.day.app
-NOTICE_BARK_DEVICE_KEY=your_device_key
+NOTICE_BARK_DEVICE_KEY=your_device_key,another_device_key
 NOTICE_BARK_GROUP=XServer-VPS
 NOTICE_BARK_SOUND=
 NOTICE_LARK_ENABLED=false
@@ -40,6 +40,8 @@ DEBUG=true \
 ```
 
 通知渠道按 Telegram → 钉钉 → Bark → Lark 的顺序串行发送。单个渠道发送失败不会阻断后续渠道；将对应的 `NOTICE_*_ENABLED` 设置为 `true` 即可启用。
+
+`NOTICE_BARK_DEVICE_KEY` 支持填写多个 Bark 设备 key，使用英文逗号分隔；通知会依次发送到每个设备。
 
 <details><summary>安装代理服务器</summary>
 

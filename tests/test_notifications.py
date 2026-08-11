@@ -6,6 +6,46 @@ import main
 
 
 class NotificationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_bark_sends_to_comma_separated_device_keys(self):
+        requests = []
+
+        class Response:
+            status = 200
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            async def text(self):
+                return '{"code": 200}'
+
+        class Session:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *args):
+                pass
+
+            def post(self, endpoint, json):
+                requests.append((endpoint, json))
+                return Response()
+
+        with patch.object(main.aiohttp, 'ClientSession', return_value=Session()):
+            result = await main.send_bark_notice(
+                'https://api.day.app',
+                ' first-key, , second-key ',
+                'Title\nMessage',
+            )
+
+        self.assertTrue(result)
+        self.assertEqual(
+            [payload['device_key'] for _, payload in requests],
+            ['first-key', 'second-key'],
+        )
+        self.assertTrue(all(endpoint.endswith('/push') for endpoint, _ in requests))
+
     async def test_enabled_channels_are_sent_serially_in_documented_order(self):
         send_order = []
 

@@ -352,7 +352,8 @@ async def send_bark_notice(
     group: str = 'XServer VPS',
     sound: str = '',
 ) -> bool:
-    if not device_key:
+    keys = [key.strip() for key in device_key.split(',') if key.strip()]
+    if not keys:
         logging.warning('Bark notification is enabled but device key is missing.')
         return False
 
@@ -364,7 +365,6 @@ async def send_bark_notice(
     title = message_lines[0] if message_lines else 'XServer VPS 通知'
     body = '\n'.join(message_lines[1:]) or title
     payload = {
-        'device_key': device_key,
         'title': title,
         'body': body,
         'group': group or 'XServer VPS',
@@ -372,22 +372,34 @@ async def send_bark_notice(
     if sound:
         payload['sound'] = sound
 
+    all_succeeded = True
     try:
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=15)) as session:
-            async with session.post(endpoint, json=payload) as resp:
-                response_body = await resp.text()
-                if resp.status >= 400:
-                    logging.warning('Bark notification failed: HTTP %s %s', resp.status, response_body)
-                    return False
+            for key in keys:
                 try:
-                    result = json.loads(response_body)
-                except json.JSONDecodeError:
-                    result = {}
-                if result.get('code', 200) != 200:
-                    logging.warning('Bark notification rejected: %s', response_body)
-                    return False
-                logging.info('Bark notification sent successfully.')
-                return True
+                    async with session.post(endpoint, json={**payload, 'device_key': key}) as resp:
+                        response_body = await resp.text()
+                        if resp.status >= 400:
+                            logging.warning(
+                                'Bark notification failed: HTTP %s %s',
+                                resp.status,
+                                response_body,
+                            )
+                            all_succeeded = False
+                            continue
+                        try:
+                            result = json.loads(response_body)
+                        except json.JSONDecodeError:
+                            result = {}
+                        if result.get('code', 200) != 200:
+                            logging.warning('Bark notification rejected: %s', response_body)
+                            all_succeeded = False
+                            continue
+                        logging.info('Bark notification sent successfully.')
+                except Exception as exc:
+                    logging.warning('Bark notification raised an exception: %s', exc)
+                    all_succeeded = False
+            return all_succeeded
     except Exception as exc:
         logging.warning('Bark notification raised an exception: %s', exc)
         return False
