@@ -61,6 +61,8 @@ FINAL_RENEW_BUTTON_SELECTOR = (
     f'a:has-text("{FINAL_RENEW_BUTTON_TEXT}")'
 )
 FINAL_RENEW_ATTEMPTS = 3
+BROWSER_OPERATION_ATTEMPTS = 3
+BROWSER_RETRY_DELAY_SECONDS = 2
 
 ENV_KEYS = (
     'EMAIL',
@@ -680,6 +682,20 @@ async def is_renewal_confirmation_transition_complete(page) -> bool:
     )
 
 
+async def is_renewal_entry_transition_complete(page) -> bool:
+    return (
+        await is_free_renewal_selection_visible(page)
+        or await is_renewal_confirmation_transition_complete(page)
+    )
+
+
+async def is_final_renewal_submission_transition_complete(page) -> bool:
+    return (
+        RENEWAL_CONFIRM_PATH not in page.url
+        or not await safe_is_visible(page.locator(FINAL_RENEW_BUTTON_SELECTOR))
+    )
+
+
 async def submit_free_renewal_form_fallback(page) -> bool:
     return await page.evaluate(
         """
@@ -785,7 +801,7 @@ async def redirect_agreement_to_dashboard(page) -> bool:
         return False
 
     logging.info('Agreement page detected after login. Opening XVPS dashboard directly...')
-    await page.goto(DASHBOARD_URL, wait_until='domcontentloaded', timeout=60000)
+    await goto_with_retries(page, DASHBOARD_URL, 'Open XVPS dashboard')
     return True
 
 
@@ -861,7 +877,7 @@ async def submit_otp_with_retries(page, otp_secret: str, max_attempts: int = 3):
 
         if state == 'otp_submitted' or OTP_DO_PATH in page.url:
             logging.info('OTP submit endpoint is still open. Trying dashboard URL directly...')
-            await page.goto(DASHBOARD_URL, wait_until='domcontentloaded', timeout=60000)
+            await goto_with_retries(page, DASHBOARD_URL, 'Open XVPS dashboard after OTP submit')
             return
 
         if state == 'login_form':
@@ -887,7 +903,7 @@ async def submit_otp_with_retries(page, otp_secret: str, max_attempts: int = 3):
 
             if OTP_DO_PATH in current_url:
                 logging.info('OTP form reached submit endpoint. Opening dashboard to continue...')
-                await page.goto(DASHBOARD_URL, wait_until='domcontentloaded', timeout=60000)
+                await goto_with_retries(page, DASHBOARD_URL, 'Open XVPS dashboard after OTP submit')
                 return
 
             if OTP_PATH not in current_url:
@@ -967,13 +983,13 @@ async def ensure_dashboard_loaded(page, otp_secret: str, email: str, password: s
 
         if OTP_DO_PATH in current_url and can_force_dashboard:
             logging.info('Landed on OTP submit endpoint. Trying to open XVPS dashboard directly...')
-            await page.goto(DASHBOARD_URL, wait_until='domcontentloaded', timeout=60000)
+            await goto_with_retries(page, DASHBOARD_URL, 'Recover XVPS dashboard after OTP submit')
             last_forced_dashboard_visit = time.time()
             continue
 
         if '/xapanel/xvps/' in current_url and can_force_dashboard:
             logging.info('Already inside XVPS area but dashboard is not ready yet. Refreshing dashboard URL...')
-            await page.goto(DASHBOARD_URL, wait_until='domcontentloaded', timeout=60000)
+            await goto_with_retries(page, DASHBOARD_URL, 'Refresh XVPS dashboard')
             last_forced_dashboard_visit = time.time()
             continue
 
@@ -995,7 +1011,7 @@ async def ensure_dashboard_loaded(page, otp_secret: str, email: str, password: s
                 logging.warning(f'Login resubmit did not finish cleanly: {exc}')
 
             logging.info('Trying to open XVPS dashboard directly...')
-            await page.goto(DASHBOARD_URL, wait_until='domcontentloaded', timeout=60000)
+            await goto_with_retries(page, DASHBOARD_URL, 'Recover XVPS dashboard after login')
             last_forced_dashboard_visit = time.time()
             continue
 
@@ -1036,29 +1052,109 @@ async def wait_for_success(success_check, timeout_ms: int = 5000, poll_ms: int =
     return await success_check()
 
 
-async def click_submit_resiliently(locator, description: str, timeout: int = 8000, success_check=None):
-    try:
-        await locator.click(timeout=timeout, no_wait_after=True)
-        if await wait_for_success(success_check, timeout_ms=timeout):
-            return
-        logging.warning('%s click completed, but page did not advance before fallback timeout.', description)
-    except Exception as exc:
-        if success_check and await success_check():
-            logging.info('%s click timed out, but page already advanced.', description)
-            return
-        logging.warning(f'{description} click did not finish cleanly: {exc}')
+async def retry_browser_operation(
+    operation,
+    description: str,
+    max_attempts: int = BROWSER_OPERATION_ATTEMPTS,
+    success_check=None,
+    retry_delay_seconds: float = BROWSER_RETRY_DELAY_SECONDS,
+):
+    """Retry transient browser operations twice after the initial attempt."""
+    last_error = None
 
-    try:
-        await locator.evaluate('(el) => el.click()')
-        if await wait_for_success(success_check, timeout_ms=timeout):
-            logging.info('%s clicked via DOM fallback.', description)
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1 and success_check and await success_check():
+            logging.info('%s already completed before retry %s/%s.', description, attempt, max_attempts)
+            return None
+
+        try:
+            return await operation()
+        except Exception as exc:
+            last_error = exc
+            if success_check and await success_check():
+                logging.info('%s raised an error, but its expected result is already visible.', description)
+                return None
+            if attempt == max_attempts:
+                break
+
+            delay = retry_delay_seconds * attempt
+            logging.warning(
+                '%s failed on attempt %s/%s: %s. Retrying in %.1fs...',
+                description,
+                attempt,
+                max_attempts,
+                exc,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+    raise last_error
+
+
+async def goto_with_retries(page, url: str, description: str, timeout: int = 60000):
+    return await retry_browser_operation(
+        lambda: page.goto(url, wait_until='domcontentloaded', timeout=timeout),
+        description,
+    )
+
+
+async def reload_with_retries(page, description: str, timeout: int = 60000):
+    return await retry_browser_operation(
+        lambda: page.reload(wait_until='domcontentloaded', timeout=timeout),
+        description,
+    )
+
+
+async def click_submit_resiliently(
+    locator,
+    description: str,
+    timeout: int = 8000,
+    success_check=None,
+    max_attempts: int = BROWSER_OPERATION_ATTEMPTS,
+):
+    last_error = None
+
+    for attempt in range(1, max_attempts + 1):
+        if attempt > 1 and success_check and await success_check():
+            logging.info('%s already advanced before click retry %s/%s.', description, attempt, max_attempts)
             return
-        logging.warning('%s DOM click fallback ran, but page still did not advance.', description)
-    except Exception as exc:
-        if success_check and await success_check():
-            logging.info('%s DOM fallback skipped because page already advanced.', description)
-            return
-        logging.warning(f'{description} DOM click fallback failed: {exc}')
+
+        try:
+            await locator.click(timeout=timeout, no_wait_after=True)
+            if await wait_for_success(success_check, timeout_ms=timeout):
+                return
+            last_error = TimeoutError(f'{description} click completed, but the page did not advance.')
+        except Exception as exc:
+            last_error = exc
+            if success_check and await success_check():
+                logging.info('%s click raised an error, but the page already advanced.', description)
+                return
+
+        try:
+            await locator.evaluate('(el) => el.click()')
+            if await wait_for_success(success_check, timeout_ms=timeout):
+                logging.info('%s clicked via DOM fallback.', description)
+                return
+            last_error = TimeoutError(f'{description} DOM click ran, but the page did not advance.')
+        except Exception as exc:
+            last_error = exc
+            if success_check and await success_check():
+                logging.info('%s DOM click raised an error, but the page already advanced.', description)
+                return
+
+        if attempt < max_attempts:
+            delay = BROWSER_RETRY_DELAY_SECONDS * attempt
+            logging.warning(
+                '%s failed on attempt %s/%s: %s. Retrying in %.1fs...',
+                description,
+                attempt,
+                max_attempts,
+                last_error,
+                delay,
+            )
+            await asyncio.sleep(delay)
+
+    raise last_error
 
 
 async def fill_otp_code(page, auth_input, otp_secret: str) -> str:
@@ -1295,7 +1391,7 @@ async def main():
         try:
             logging.info('Navigating to login...')
             # Use domcontentloaded to avoid getting stuck on tracking pixels
-            await page.goto(LOGIN_URL, wait_until='domcontentloaded', timeout=60000)
+            await goto_with_retries(page, LOGIN_URL, 'Open XServer login page')
             login_state = await wait_for_login_entry_state(page, timeout_ms=45000)
             
             if login_state == 'login_form':
@@ -1305,7 +1401,11 @@ async def main():
                 logging.info('Skipping primary login; current state is %s.', login_state)
 
             logging.info('Ensuring dashboard is fully reachable...')
-            await ensure_dashboard_loaded(page, auth_login_otp, email, password)
+            await retry_browser_operation(
+                lambda: ensure_dashboard_loaded(page, auth_login_otp, email, password),
+                'Wait for XServer dashboard',
+                success_check=lambda: safe_is_visible(page.locator(DASHBOARD_DETAIL_LINK_SELECTOR)),
+            )
             await save_browser_auth_state(context)
             await close_free_user_campaign_modal(page)
 
@@ -1314,10 +1414,10 @@ async def main():
             detail_href = await detail_link.get_attribute('href', timeout=5000)
             if not detail_href:
                 raise RuntimeError('Could not read the server detail link URL.')
-            await page.goto(
+            await goto_with_retries(
+                page,
                 urljoin(DASHBOARD_URL, detail_href),
-                wait_until='domcontentloaded',
-                timeout=60000,
+                'Open server detail page',
             )
             
             logging.info('Waiting for server detail page...')
@@ -1369,7 +1469,12 @@ async def main():
                 await page.screenshot(path='skip_renewal.png', full_page=True)
                 return
 
-            await page.locator('text="更新する"').click()
+            await click_submit_resiliently(
+                page.locator('text="更新する"'),
+                'Open renewal page button',
+                timeout=30000,
+                success_check=lambda: is_renewal_entry_transition_complete(page),
+            )
 
             logging.info('Proceeding to renewal selection...')
             renewal_state = await open_free_renewal_confirmation(page)
@@ -1407,7 +1512,7 @@ async def main():
                         attempt,
                         FINAL_RENEW_ATTEMPTS,
                     )
-                    await page.reload(wait_until='domcontentloaded', timeout=60000)
+                    await reload_with_retries(page, 'Refresh renewal confirmation page')
                     renewal_state = await wait_for_renewal_page_or_status(page, timeout_ms=30000)
                     if renewal_state == 'selection':
                         renewal_state = await open_free_renewal_confirmation(page)
@@ -1479,14 +1584,19 @@ async def main():
                     )
                 else:
                     logging.info('Executing final renewal submission...')
-                    await button.click(timeout=30000, no_wait_after=True)
+                    await click_submit_resiliently(
+                        button,
+                        'Final renewal button',
+                        timeout=30000,
+                        success_check=lambda: is_final_renewal_submission_transition_complete(page),
+                    )
                     renewed_at_jst = now_in_jst()
                     await asyncio.sleep(3)
                     await page.screenshot(path='after_click.png', full_page=True)
                     logging.info('Captured post-click screenshot after 3 seconds.')
 
                     logging.info('Refreshing detail page to fetch latest renewal data...')
-                    await page.goto(detail_url, wait_until='domcontentloaded', timeout=60000)
+                    await goto_with_retries(page, detail_url, 'Refresh server detail after renewal')
                     await page.wait_for_selector('table.table', timeout=30000)
                     latest_server_info = normalize_server_info(await extract_server_info(page))
                     if not latest_server_info['expiry_date_raw']:
