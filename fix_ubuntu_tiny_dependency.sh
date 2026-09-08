@@ -121,7 +121,7 @@ install_python_deps() {
     "$PYTHON_BIN" -m pip install -r "${SCRIPT_DIR}/requirements.txt"
   else
     log "requirements.txt not found; installing core packages only..."
-    "$PYTHON_BIN" -m pip install 'camoufox[geoip]' aiohttp playwright-captcha
+    "$PYTHON_BIN" -m pip install 'camoufox[geoip]' aiohttp playwright-captcha 'tensorflow==2.18.1'
   fi
 
   "$PYTHON_BIN" -m pip install --upgrade camoufox browserforge

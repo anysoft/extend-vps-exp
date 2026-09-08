@@ -1,4 +1,4 @@
-[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1l1fAyDzNSSCVOF_JBpXRp2b3SHuI5bz6?usp=sharing) Accuracy 100% CAPTCHA weight: xserver_captcha.keras [repo](https://github.com/GitHub30/captcha-cloudrun)
+[![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/drive/1l1fAyDzNSSCVOF_JBpXRp2b3SHuI5bz6?usp=sharing) CAPTCHA model source: [captcha-cloudrun](https://github.com/GitHub30/captcha-cloudrun)
 
 [![](https://github.com/user-attachments/assets/f3db034f-1b1b-4983-9f9a-06a3aeb1b64e)](https://colab.research.google.com/drive/1l1fAyDzNSSCVOF_JBpXRp2b3SHuI5bz6?usp=sharing)
 
@@ -42,6 +42,19 @@ DEBUG=true \
 通知渠道按 Telegram → 钉钉 → Bark → Lark 的顺序串行发送。单个渠道发送失败不会阻断后续渠道；将对应的 `NOTICE_*_ENABLED` 设置为 `true` 即可启用。
 
 `NOTICE_BARK_DEVICE_KEY` 支持填写多个 Bark 设备 key，使用英文逗号分隔；通知会依次发送到每个设备。
+
+## 本地图片验证码识别
+
+XServer 数字验证码现在由 Python 进程内的 TensorFlow/Keras 模型识别，不再调用公共 Cloud Run OCR API。模型固定放在 `captcha/xserver_captcha.keras`，程序使用相对于模块文件的绝对路径加载，因此不依赖启动时的工作目录。模型会延迟加载一次并在后续识别中复用。
+
+依赖安装及测试：
+
+```bash
+pip install -r requirements.txt
+python -m unittest discover -s tests -v
+```
+
+测试使用参考仓库已有的合法样例确认模型加载、预处理、推理和数字 CTC decode 链路可执行，但样例没有标注真实答案，因此不代表已验证生产验证码识别准确率。
 
 <details><summary>安装代理服务器</summary>
 

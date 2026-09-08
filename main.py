@@ -17,6 +17,7 @@ from browserforge.fingerprints import Screen
 from camoufox.async_api import AsyncCamoufox
 from playwright_captcha import CaptchaType, ClickSolver, FrameworkType
 from playwright_captcha.utils.camoufox_add_init_script.add_init_script import get_addon_path
+from captcha import CaptchaRecognitionError, recognize_captcha
 from renewal_timing import (
     is_in_renewal_window,
     now_in_jst,
@@ -1523,14 +1524,13 @@ async def main():
                         return
 
                 logging.info('Retrieving captcha (attempt %s/%s)...', attempt, FINAL_RENEW_ATTEMPTS)
-                body = await page.eval_on_selector(CAPTCHA_IMAGE_SELECTOR, 'img => img.src')
-
-                # Solve custom image captcha
-                async with aiohttp.ClientSession() as session:
-                    async with session.post('https://captcha-120546510085.asia-northeast1.run.app', data=body) as resp:
-                        code = await resp.text()
-
-                logging.info(f'Resolved captcha code: {code}')
+                captcha_src = await page.eval_on_selector(CAPTCHA_IMAGE_SELECTOR, 'img => img.src')
+                try:
+                    code = await asyncio.to_thread(recognize_captcha, captcha_src)
+                except CaptchaRecognitionError as exc:
+                    logging.error('Local captcha OCR failed: %s', exc)
+                    raise
+                logging.info('Local captcha OCR result: %s', code)
 
                 input_loc = page.locator('[placeholder="上の画像の数字を入力"]')
                 await input_loc.fill('')
