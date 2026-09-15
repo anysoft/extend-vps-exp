@@ -37,10 +37,12 @@ def is_in_renewal_window(expiry_date: date, now_jst: datetime, state: dict | Non
 
 
 def should_attempt_login_from_state(state: dict, now_jst: datetime) -> bool:
-    """Use the cached date to avoid logging in outside the renewal window.
+    """Decide whether the cached expiry requires checking XServer.
 
-    Missing or malformed state deliberately falls back to logging in so that a
-    damaged cache cannot permanently prevent renewal.
+    A future renewal window means the cache is still usable and login can be
+    skipped. Once the cached window starts, login is needed for renewal. If the
+    cached expiry has already passed, treat it as stale and login to refresh it.
+    Missing or malformed cache data also falls back to logging in.
     """
     next_expiry = state.get('next_expiry_date')
     if not next_expiry:
@@ -51,7 +53,8 @@ def should_attempt_login_from_state(state: dict, now_jst: datetime) -> bool:
     except (TypeError, ValueError):
         return True
 
-    return is_in_renewal_window(expiry_date, now_jst, state)
+    renewal_opens_at, _ = renewal_window_for_expiry_date(expiry_date)
+    return _as_jst(now_jst) >= renewal_opens_at
 
 
 def _as_jst(value: datetime) -> datetime:

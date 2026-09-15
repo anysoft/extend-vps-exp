@@ -114,5 +114,57 @@ class ResilientClickTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(locator.evaluate_calls, 0)
 
 
+class RenewalRetryRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_dashboard_is_detected_without_waiting_for_confirmation_timeout(self):
+        class HiddenLocator:
+            @property
+            def first(self):
+                return self
+
+            async def is_visible(self, timeout=None):
+                return False
+
+        class Page:
+            url = main.DASHBOARD_URL
+
+            def locator(self, selector):
+                return HiddenLocator()
+
+        self.assertEqual(
+            await main.wait_for_renewal_page_or_status(Page(), timeout_ms=1000),
+            'dashboard',
+        )
+
+    async def test_retry_rebuilds_confirmation_from_detail_instead_of_reloading(self):
+        class Page:
+            def __init__(self):
+                self.wait_for_selector = AsyncMock()
+                self.reload = AsyncMock(side_effect=AssertionError('POST confirmation must not be reloaded'))
+
+            def locator(self, selector):
+                return f'locator:{selector}'
+
+        page = Page()
+        detail_url = 'https://secure.xserver.ne.jp/xapanel/xvps/server/detail?id=123'
+
+        with (
+            patch.object(main, 'goto_with_retries', new=AsyncMock()) as goto,
+            patch.object(main, 'click_submit_resiliently', new=AsyncMock()) as click,
+            patch.object(
+                main,
+                'open_free_renewal_confirmation',
+                new=AsyncMock(return_value='captcha'),
+            ) as open_confirmation,
+        ):
+            state = await main.reopen_renewal_confirmation_from_detail(page, detail_url)
+
+        self.assertEqual(state, 'captcha')
+        goto.assert_awaited_once_with(page, detail_url, 'Reopen server detail for renewal retry')
+        page.wait_for_selector.assert_awaited_once_with('text="更新する"', timeout=30000)
+        click.assert_awaited_once()
+        open_confirmation.assert_awaited_once_with(page)
+        page.reload.assert_not_awaited()
+
+
 if __name__ == '__main__':
     unittest.main()

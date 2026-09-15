@@ -23,7 +23,7 @@ from captcha import CaptchaRecognitionError, recognize_captcha
 from renewal_timing import (
     is_in_renewal_window,
     now_in_jst,
-    renewal_window_from_state,
+    renewal_window_for_expiry_date,
     should_attempt_login_from_state,
 )
 
@@ -661,6 +661,8 @@ async def wait_for_renewal_page_or_status(page, timeout_ms: int = 30000) -> str:
             state = 'confirmation_loading'
         elif await safe_is_visible(page.locator(FINAL_RENEW_BUTTON_SELECTOR)):
             state = 'final_button'
+        elif page.url.rstrip('/') == DASHBOARD_URL.rstrip('/'):
+            state = 'dashboard'
         else:
             state = 'waiting'
 
@@ -668,7 +670,7 @@ async def wait_for_renewal_page_or_status(page, timeout_ms: int = 30000) -> str:
             logging.info('Renewal page state: %s url=%s', state, page.url)
             last_logged_state = state
 
-        if state in ('captcha', 'selection', 'suspended'):
+        if state in ('captcha', 'selection', 'suspended', 'dashboard'):
             return state
 
         await asyncio.sleep(0.5)
@@ -732,6 +734,8 @@ async def open_free_renewal_confirmation(page, max_attempts: int = 3) -> str:
         state = await wait_for_renewal_page_or_status(page, timeout_ms=15000)
         if state in ('captcha', 'suspended'):
             return state
+        if state == 'dashboard':
+            raise RuntimeError('Renewal flow returned to the XServer dashboard before confirmation.')
 
         logging.info('Clicking free renewal selection (attempt %s/%s)...', attempt, max_attempts)
         await click_submit_resiliently(
@@ -744,6 +748,8 @@ async def open_free_renewal_confirmation(page, max_attempts: int = 3) -> str:
         state = await wait_for_renewal_page_or_status(page, timeout_ms=15000)
         if state in ('captcha', 'suspended'):
             return state
+        if state == 'dashboard':
+            raise RuntimeError('Renewal flow returned to the XServer dashboard before confirmation.')
 
         if state == 'selection':
             logging.info('Free renewal selection click stayed on selection page; submitting the form via DOM fallback...')
@@ -754,11 +760,27 @@ async def open_free_renewal_confirmation(page, max_attempts: int = 3) -> str:
             state = await wait_for_renewal_page_or_status(page, timeout_ms=20000)
             if state in ('captcha', 'suspended'):
                 return state
+            if state == 'dashboard':
+                raise RuntimeError('Renewal flow returned to the XServer dashboard before confirmation.')
 
         logging.warning('Free renewal selection did not advance to confirmation page on attempt %s.', attempt)
 
     await capture_diagnostics(page, 'renewal_selection_timeout')
     raise TimeoutError(f'Timed out opening free renewal confirmation page. url={page.url}')
+
+
+async def reopen_renewal_confirmation_from_detail(page, detail_url: str) -> str:
+    """Rebuild the POST-backed confirmation page instead of reloading it."""
+    logging.info('Returning to server detail page to rebuild the renewal confirmation flow...')
+    await goto_with_retries(page, detail_url, 'Reopen server detail for renewal retry')
+    await page.wait_for_selector('text="更新する"', timeout=30000)
+    await click_submit_resiliently(
+        page.locator('text="更新する"'),
+        'Reopen renewal page button',
+        timeout=30000,
+        success_check=lambda: is_renewal_entry_transition_complete(page),
+    )
+    return await open_free_renewal_confirmation(page)
 
 
 async def wait_for_final_renew_button(page, timeout_ms: int = 60000):
@@ -1346,12 +1368,12 @@ async def main():
     proxy_server = os.getenv('PROXY_SERVER')
     debug_mode = os.getenv('DEBUG', 'false').lower() == 'true'
     current_jst = now_in_jst()
-    today_jst = current_jst.date()
     local_state = load_local_state()
 
     if not should_attempt_login_from_state(local_state, current_jst):
         logging.info(
-            'SKIP: Local state is outside the 12-hour renewal window. next_expiry_date=%s current_jst=%s',
+            'SKIP: Cached expiry is valid and its renewal window has not started. '
+            'next_expiry_date=%s current_jst=%s',
             local_state.get('next_expiry_date', '-'),
             current_jst.isoformat(timespec='seconds'),
         )
@@ -1436,9 +1458,9 @@ async def main():
             current_jst = now_in_jst()
             today_jst = current_jst.date()
             expiry_date = parse_japanese_date(server_info['expiry_date_raw'])
-            renewal_opens_at, expires_at = renewal_window_from_state(local_state, expiry_date)
-            should_renew = is_in_renewal_window(expiry_date, current_jst, local_state)
             save_local_state(server_info, today_jst)
+            renewal_opens_at, expires_at = renewal_window_for_expiry_date(expiry_date)
+            should_renew = is_in_renewal_window(expiry_date, current_jst)
 
             logging.info(
                 'Server detail: service_code=%s expiry=%s last_update=%s current_jst=%s renewal_opens_at=%s expires_at=%s should_renew=%s',
@@ -1511,17 +1533,14 @@ async def main():
             for attempt in range(1, FINAL_RENEW_ATTEMPTS + 1):
                 if attempt > 1:
                     logging.info(
-                        'Refreshing renewal confirmation page before retrying captcha/Turnstile (attempt %s/%s)...',
+                        'Rebuilding renewal confirmation flow before retrying captcha/Turnstile (attempt %s/%s)...',
                         attempt,
                         FINAL_RENEW_ATTEMPTS,
                     )
-                    await reload_with_retries(page, 'Refresh renewal confirmation page')
-                    renewal_state = await wait_for_renewal_page_or_status(page, timeout_ms=30000)
-                    if renewal_state == 'selection':
-                        renewal_state = await open_free_renewal_confirmation(page)
+                    renewal_state = await reopen_renewal_confirmation_from_detail(page, detail_url)
 
                     if renewal_state == 'suspended':
-                        logging.info('SKIP: Renewal is not yet available after retry refresh (detected .newApp__suspended).')
+                        logging.info('SKIP: Renewal is not yet available after rebuilding retry flow (detected .newApp__suspended).')
                         await page.screenshot(path='skip_renewal.png', full_page=True)
                         return
 
