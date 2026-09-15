@@ -68,6 +68,7 @@ systemctl status tinyproxy
 ```
 </details>
 
+# 依赖处理
 
 ```bash
 # 依赖安装 playwright
@@ -91,8 +92,8 @@ apt install -y libasound2t64
 
 apt install   libasound2  
 
-
-
+pip install camoufox
+python -m camoufox fetch
 
 ```
 

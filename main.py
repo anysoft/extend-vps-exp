@@ -1,3 +1,5 @@
+# cron: 30 9 * * *
+# new Env("Xserver VPS自动续期")
 import asyncio
 import base64
 import binascii
