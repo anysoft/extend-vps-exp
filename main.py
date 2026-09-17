@@ -7,6 +7,7 @@ import hashlib
 import hmac
 import json
 import os
+import socket
 import sys
 import logging
 import aiohttp
@@ -456,6 +457,7 @@ async def send_lark_notice(webhook: str, secret: str, message: str) -> bool:
 
 async def send_notice(message: str) -> dict[str, bool]:
     """Send enabled notifications serially: Telegram, DingTalk, Bark, then Lark."""
+    message = f'{message}\n执行主机: {socket.gethostname()}'
     tg_token = os.getenv('NOTICE_TG_TOKEN', '')
     tg_user_id = os.getenv('NOTICE_TG_USERID', '')
     channels = [

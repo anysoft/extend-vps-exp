@@ -50,18 +50,22 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         send_order = []
 
         async def telegram(*args):
+            self.assertEqual(args[2], '✅ test\n执行主机: nas-node-1')
             send_order.append('telegram')
             return True
 
         async def dingtalk(*args):
+            self.assertEqual(args[2], '✅ test\n执行主机: nas-node-1')
             send_order.append('dingtalk')
             return True
 
         async def bark(*args):
+            self.assertEqual(args[2], '✅ test\n执行主机: nas-node-1')
             send_order.append('bark')
             return True
 
         async def lark(*args):
+            self.assertEqual(args[2], '✅ test\n执行主机: nas-node-1')
             send_order.append('lark')
             return True
 
@@ -78,6 +82,7 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
         }
         with (
             patch.dict(os.environ, env, clear=True),
+            patch.object(main.socket, 'gethostname', return_value='nas-node-1'),
             patch.object(main, 'send_telegram_notice', side_effect=telegram),
             patch.object(main, 'send_dingtalk_notice', side_effect=dingtalk),
             patch.object(main, 'send_bark_notice', side_effect=bark),
