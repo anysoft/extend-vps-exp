@@ -968,6 +968,29 @@ async def submit_otp_with_retries(page, otp_secret: str, max_attempts: int = 3):
     raise RuntimeError('Failed to complete two-step authentication after multiple attempts.')
 
 
+class LoginRejectedError(RuntimeError):
+    """An explicit login rejection must never trigger automatic resubmission."""
+
+
+async def raise_if_login_rejected(page):
+    if '/xapanel/login/' not in page.url:
+        return
+    messages = await page.locator('.errorMessage:visible:not(#turnstile-error)').all_inner_texts()
+    message = ' '.join(' '.join(messages).split())
+    if not message:
+        return
+    if 'ロック' in message:
+        reason = 'XServer 账号已被临时锁定'
+        if '24時間' in message:
+            reason += '（页面提示 24 小时后解除）'
+    elif 'パスワード' in message or 'アカウントID' in message or 'メールアドレス' in message:
+        reason = 'XServer 拒绝登录：账号、邮箱或密码校验失败，请检查登录信息'
+    else:
+        reason = 'XServer 登录页面显示拒绝提示，请查看失败截图确认具体原因'
+    # Do not copy server-rendered account identifiers into notification text.
+    raise LoginRejectedError(reason + '；已停止本次自动登录重试')
+
+
 async def login_turnstile_completed(page) -> bool:
     # Never log the token. The login button itself is enabled even before verification.
     return await page.evaluate("""() => {
@@ -1024,6 +1047,7 @@ async def ensure_login_turnstile(page):
 
 
 async def submit_primary_login(page, email: str, password: str):
+    await raise_if_login_rejected(page)
     state = await wait_for_login_entry_state(page, timeout_ms=30000)
     if state != 'login_form':
         logging.info('Primary login form is not needed; current state is %s.', state)
@@ -1032,6 +1056,7 @@ async def submit_primary_login(page, email: str, password: str):
     await page.locator(LOGIN_MEMBER_ID_SELECTOR).fill(email)
     await page.locator(LOGIN_PASSWORD_SELECTOR).fill(password)
     await ensure_login_turnstile(page)
+    await raise_if_login_rejected(page)
     await click_submit_resiliently(
         page.locator('text="ログインする"'),
         'Primary login button',
@@ -1082,6 +1107,8 @@ async def ensure_dashboard_loaded(page, otp_secret: str, email: str, password: s
                 await submit_primary_login(page, email, password)
                 last_forced_dashboard_visit = time.time()
                 continue
+            except LoginRejectedError:
+                raise
             except Exception as exc:
                 if (
                     OTP_PATH in page.url
@@ -1105,6 +1132,7 @@ async def ensure_dashboard_loaded(page, otp_secret: str, email: str, password: s
 
 
 async def is_login_transition_started(page) -> bool:
+    await raise_if_login_rejected(page)
     current_url = page.url
     return (
         OTP_PATH in current_url
@@ -1152,6 +1180,8 @@ async def retry_browser_operation(
 
         try:
             return await operation()
+        except LoginRejectedError:
+            raise
         except Exception as exc:
             last_error = exc
             if success_check and await success_check():
@@ -1207,6 +1237,8 @@ async def click_submit_resiliently(
             if await wait_for_success(success_check, timeout_ms=timeout):
                 return
             last_error = TimeoutError(f'{description} click completed, but the page did not advance.')
+        except LoginRejectedError:
+            raise
         except Exception as exc:
             last_error = exc
             if success_check and await success_check():
@@ -1219,6 +1251,8 @@ async def click_submit_resiliently(
                 logging.info('%s clicked via DOM fallback.', description)
                 return
             last_error = TimeoutError(f'{description} DOM click ran, but the page did not advance.')
+        except LoginRejectedError:
+            raise
         except Exception as exc:
             last_error = exc
             if success_check and await success_check():

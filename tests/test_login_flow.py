@@ -83,6 +83,53 @@ class FakeContext:
 
 
 class LoginFlowTests(unittest.IsolatedAsyncioTestCase):
+    def rejection_page(self, message):
+        page = MagicMock()
+        page.url = main.LOGIN_URL
+        page.locator.return_value.all_inner_texts = AsyncMock(return_value=[message])
+        return page
+
+    async def test_locked_account_stops_before_credentials_or_solver(self):
+        page = self.rejection_page('アカウントを一時的にロックしました。24時間後に解除されます')
+        with patch.object(main, 'ensure_login_turnstile', new=AsyncMock()) as verify:
+            with self.assertRaisesRegex(main.LoginRejectedError, '24 小时'):
+                await main.submit_primary_login(page, 'user', 'password')
+        verify.assert_not_awaited()
+        page.locator.return_value.fill.assert_not_called()
+
+    async def test_password_error_after_click_prevents_dom_fallback_and_retries(self):
+        page = self.rejection_page('メールアドレスまたはパスワードが正しくありません')
+        button = MagicMock()
+        button.click = AsyncMock()
+        button.evaluate = AsyncMock()
+        with self.assertRaisesRegex(main.LoginRejectedError, '密码校验失败'):
+            await main.click_submit_resiliently(
+                button, 'Primary login button',
+                success_check=lambda: main.is_login_transition_started(page),
+            )
+        button.click.assert_awaited_once()
+        button.evaluate.assert_not_awaited()
+
+    async def test_browser_retry_does_not_retry_login_rejection(self):
+        operation = AsyncMock(side_effect=main.LoginRejectedError('locked'))
+        with self.assertRaises(main.LoginRejectedError):
+            await main.retry_browser_operation(operation, 'dashboard')
+        operation.assert_awaited_once()
+
+    async def test_dashboard_recovery_does_not_swallow_login_rejection(self):
+        page = self.rejection_page('アカウントをロックしました')
+        with (
+            patch.object(main, 'safe_is_visible', new=AsyncMock(return_value=False)),
+            patch.object(main, 'goto_with_retries', new=AsyncMock()) as goto,
+        ):
+            page.locator.return_value.first.is_visible = AsyncMock(return_value=False)
+            with self.assertRaises(main.LoginRejectedError):
+                await main.ensure_dashboard_loaded(page, '', 'user', 'password')
+        goto.assert_not_awaited()
+
+    async def test_empty_error_message_allows_login(self):
+        await main.raise_if_login_rejected(self.rejection_page('  '))
+
     async def test_login_without_widget_does_not_invoke_solver(self):
         page = MagicMock()
         page.locator.return_value.count = AsyncMock(return_value=0)
