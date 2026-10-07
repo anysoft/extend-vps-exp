@@ -1,4 +1,5 @@
 import json
+import asyncio
 import tempfile
 import time
 import unittest
@@ -100,7 +101,7 @@ class LoginFlowTests(unittest.IsolatedAsyncioTestCase):
     async def test_solver_error_with_valid_token_still_allows_login(self):
         page = MagicMock()
         page.locator.return_value.count = AsyncMock(return_value=1)
-        page.evaluate = AsyncMock(side_effect=[False, True])
+        page.evaluate = AsyncMock(side_effect=[False, False, True])
         solver = AsyncMock()
         solver.solve_captcha.side_effect = RuntimeError('success element missing')
         manager = AsyncMock()
@@ -119,6 +120,39 @@ class LoginFlowTests(unittest.IsolatedAsyncioTestCase):
         ):
             with self.assertRaisesRegex(TimeoutError, 'credentials were not submitted'):
                 await main.ensure_login_turnstile(page)
+
+    async def test_token_arriving_during_checkbox_wait_cancels_and_cleans_solver(self):
+        page = MagicMock()
+        page.locator.return_value.count = AsyncMock(return_value=1)
+        verified = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def completed(page):
+            return verified.is_set()
+
+        async def solve(**kwargs):
+            verified.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        solver = AsyncMock()
+        solver.solve_captcha.side_effect = solve
+        manager = AsyncMock()
+        manager.__aenter__.return_value = solver
+
+        async def cleanup(*args):
+            self.assertTrue(cancelled.is_set())
+            return False
+
+        manager.__aexit__.side_effect = cleanup
+        with (
+            patch.object(main, 'ClickSolver', return_value=manager),
+            patch.object(main, 'login_turnstile_completed', side_effect=completed),
+        ):
+            await asyncio.wait_for(main.ensure_login_turnstile(page), timeout=2)
+        manager.__aexit__.assert_awaited_once()
 
     async def test_failed_verification_prevents_login_click(self):
         page = MagicMock()

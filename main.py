@@ -990,10 +990,29 @@ async def ensure_login_turnstile(page):
     logging.info('Login Turnstile detected; waiting for verification before submitting credentials...')
     try:
         async with ClickSolver(framework=FrameworkType.CAMOUFOX, page=page) as solver:
-            await solver.solve_captcha(
+            solve_task = asyncio.create_task(solver.solve_captcha(
                 captcha_container=page,
                 captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE,
-            )
+            ))
+            try:
+                deadline = time.monotonic() + 90
+                while True:
+                    # Verification can finish automatically while the solver is
+                    # still looking for a checkbox that has already disappeared.
+                    if await login_turnstile_completed(page):
+                        logging.info('Login Turnstile token received; stopping checkbox wait.')
+                        return
+                    if solve_task.done():
+                        await solve_task
+                        break
+                    if time.monotonic() >= deadline:
+                        break
+                    await asyncio.wait({solve_task}, timeout=0.25)
+            finally:
+                # Finish cancellation before the solver context restores page hooks.
+                if not solve_task.done():
+                    solve_task.cancel()
+                await asyncio.gather(solve_task, return_exceptions=True)
     except Exception:
         # Solver UI detection may fail even when the site received a valid token.
         logging.warning('Login Turnstile interaction did not confirm success; checking page verification state.')
