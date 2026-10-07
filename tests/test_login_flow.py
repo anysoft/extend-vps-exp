@@ -3,6 +3,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import main
 
@@ -81,6 +82,56 @@ class FakeContext:
 
 
 class LoginFlowTests(unittest.IsolatedAsyncioTestCase):
+    async def test_login_without_widget_does_not_invoke_solver(self):
+        page = MagicMock()
+        page.locator.return_value.count = AsyncMock(return_value=0)
+        with patch.object(main, 'ClickSolver') as solver:
+            await main.ensure_login_turnstile(page)
+        solver.assert_not_called()
+
+    async def test_already_verified_widget_does_not_invoke_solver(self):
+        page = MagicMock()
+        page.locator.return_value.count = AsyncMock(return_value=1)
+        page.evaluate = AsyncMock(return_value=True)
+        with patch.object(main, 'ClickSolver') as solver:
+            await main.ensure_login_turnstile(page)
+        solver.assert_not_called()
+
+    async def test_solver_error_with_valid_token_still_allows_login(self):
+        page = MagicMock()
+        page.locator.return_value.count = AsyncMock(return_value=1)
+        page.evaluate = AsyncMock(side_effect=[False, True])
+        solver = AsyncMock()
+        solver.solve_captcha.side_effect = RuntimeError('success element missing')
+        manager = AsyncMock()
+        manager.__aenter__.return_value = solver
+        with patch.object(main, 'ClickSolver', return_value=manager):
+            await main.ensure_login_turnstile(page)
+        solver.solve_captcha.assert_awaited_once()
+
+    async def test_solver_success_without_token_is_rejected(self):
+        page = MagicMock()
+        page.locator.return_value.count = AsyncMock(return_value=1)
+        page.evaluate = AsyncMock(return_value=False)
+        with (
+            patch.object(main, 'ClickSolver', return_value=AsyncMock()),
+            patch.object(main, 'wait_for_success', new=AsyncMock(return_value=False)),
+        ):
+            with self.assertRaisesRegex(TimeoutError, 'credentials were not submitted'):
+                await main.ensure_login_turnstile(page)
+
+    async def test_failed_verification_prevents_login_click(self):
+        page = MagicMock()
+        page.locator.return_value.fill = AsyncMock()
+        with (
+            patch.object(main, 'wait_for_login_entry_state', new=AsyncMock(return_value='login_form')),
+            patch.object(main, 'ensure_login_turnstile', new=AsyncMock(side_effect=TimeoutError('verification'))),
+            patch.object(main, 'click_submit_resiliently', new=AsyncMock()) as click,
+        ):
+            with self.assertRaises(TimeoutError):
+                await main.submit_primary_login(page, 'test', 'test')
+        click.assert_not_awaited()
+
     async def test_checks_remember_device_before_otp_submission(self):
         checkbox = FakeLocator(checked=False)
         page = FakePage('https://secure.xserver.ne.jp/xapanel/myaccount/twostepauth/index', checkbox)

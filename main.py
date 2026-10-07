@@ -968,6 +968,42 @@ async def submit_otp_with_retries(page, otp_secret: str, max_attempts: int = 3):
     raise RuntimeError('Failed to complete two-step authentication after multiple attempts.')
 
 
+async def login_turnstile_completed(page) -> bool:
+    # Never log the token. The login button itself is enabled even before verification.
+    return await page.evaluate("""() => {
+        const token = document.querySelector('input[name="cf-turnstile-response"]');
+        const error = document.querySelector('#turnstile-error');
+        const hasError = error && error.getClientRects().length > 0 && error.textContent.trim();
+        return !!(token && token.value.trim() && !hasError);
+    }""")
+
+
+async def ensure_login_turnstile(page):
+    # Check attachment rather than visibility: the widget can still be loading.
+    present = await page.locator(
+        '#turnstile-widget, .cf-turnstile, input[name="cf-turnstile-response"], '
+        'script[src*="challenges.cloudflare.com/turnstile/"]'
+    ).count()
+    if not present or await login_turnstile_completed(page):
+        return
+
+    logging.info('Login Turnstile detected; waiting for verification before submitting credentials...')
+    try:
+        async with ClickSolver(framework=FrameworkType.CAMOUFOX, page=page) as solver:
+            await solver.solve_captcha(
+                captcha_container=page,
+                captcha_type=CaptchaType.CLOUDFLARE_TURNSTILE,
+            )
+    except Exception:
+        # Solver UI detection may fail even when the site received a valid token.
+        logging.warning('Login Turnstile interaction did not confirm success; checking page verification state.')
+
+    if await wait_for_success(lambda: login_turnstile_completed(page), timeout_ms=30000):
+        logging.info('Login Turnstile verification completed.')
+        return
+    raise TimeoutError('Login Cloudflare Turnstile verification did not complete; credentials were not submitted.')
+
+
 async def submit_primary_login(page, email: str, password: str):
     state = await wait_for_login_entry_state(page, timeout_ms=30000)
     if state != 'login_form':
@@ -976,6 +1012,7 @@ async def submit_primary_login(page, email: str, password: str):
 
     await page.locator(LOGIN_MEMBER_ID_SELECTOR).fill(email)
     await page.locator(LOGIN_PASSWORD_SELECTOR).fill(password)
+    await ensure_login_turnstile(page)
     await click_submit_resiliently(
         page.locator('text="ログインする"'),
         'Primary login button',
