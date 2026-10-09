@@ -87,6 +87,7 @@ ENV_KEYS = (
     'NOTICE_LARK_ENABLED',
     'NOTICE_LARK_WEBHOOK',
     'NOTICE_LARK_SECRET',
+    'NOTICE_OUTSIDE_RENEWAL_WINDOW_ENABLED',
     'DEBUG',
 )
 
@@ -277,6 +278,10 @@ def env_flag(name: str, default: bool = False) -> bool:
     if value is None or not value.strip():
         return default
     return value.strip().lower() in ('1', 'true', 'yes', 'on')
+
+
+def outside_renewal_window_notice_enabled() -> bool:
+    return env_flag('NOTICE_OUTSIDE_RENEWAL_WINDOW_ENABLED', default=True)
 
 
 async def send_telegram_notice(token: str, user_id: str, message: str) -> bool:
@@ -1568,7 +1573,12 @@ async def main():
             if not should_renew:
                 logging.info('SKIP: Current time is outside the final 12 hours of the expiry date.')
                 notice_reason = 'skip_outside_renewal_window'
-                if should_send_daily_notice(today_jst, notice_reason):
+                if not outside_renewal_window_notice_enabled():
+                    logging.info(
+                        'SKIP: Outside-renewal-window notification is disabled by '
+                        'NOTICE_OUTSIDE_RENEWAL_WINDOW_ENABLED.'
+                    )
+                elif should_send_daily_notice(today_jst, notice_reason):
                     notice_results = await send_notice(
                         format_server_info_message(
                             '⚠️ XServer VPS 暂未续期：当前不在 12 小时续期窗口',

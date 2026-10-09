@@ -22,6 +22,7 @@ EMAIL=your@gmail.com
 PASSWORD=yourpassword
 AUTH_LOGIN_OTP=your_base32_totp_secret
 PROXY_SERVER=http://user:password@example.com:8888
+NOTICE_OUTSIDE_RENEWAL_WINDOW_ENABLED=true
 NOTICE_TG_ENABLED=true
 NOTICE_TG_TOKEN=telegram_bot_token
 NOTICE_TG_USERID=telegram_chat_id
@@ -40,6 +41,8 @@ DEBUG=true \
 ```
 
 通知渠道按 Telegram → 钉钉 → Bark → Lark 的顺序串行发送。单个渠道发送失败不会阻断后续渠道；将对应的 `NOTICE_*_ENABLED` 设置为 `true` 即可启用。
+
+`NOTICE_OUTSIDE_RENEWAL_WINDOW_ENABLED` 默认为 `true`。在不负责告警的其他服务器上设置为 `false`，可关闭“当前不在 12 小时续期窗口”提醒；续期成功、续期失败及其他提醒不受影响。
 
 `NOTICE_BARK_DEVICE_KEY` 支持填写多个 Bark 设备 key，使用英文逗号分隔；通知会依次发送到每个设备。
 

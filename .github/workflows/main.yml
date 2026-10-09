@@ -78,6 +78,7 @@ jobs:
           NOTICE_LARK_ENABLED: ${{ vars.NOTICE_LARK_ENABLED || 'false' }}
           NOTICE_LARK_WEBHOOK: ${{ secrets.NOTICE_LARK_WEBHOOK }}
           NOTICE_LARK_SECRET: ${{ secrets.NOTICE_LARK_SECRET }}
+          NOTICE_OUTSIDE_RENEWAL_WINDOW_ENABLED: ${{ vars.NOTICE_OUTSIDE_RENEWAL_WINDOW_ENABLED || 'true' }}
           DEBUG: ${{ vars.DEBUG || 'false' }}
           DISPLAY: :99
         run: |

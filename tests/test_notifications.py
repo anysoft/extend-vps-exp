@@ -139,6 +139,18 @@ class NotificationTests(unittest.IsolatedAsyncioTestCase):
                 )
             )
 
+    def test_outside_renewal_window_notice_is_enabled_by_default(self):
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertTrue(main.outside_renewal_window_notice_enabled())
+
+    def test_outside_renewal_window_notice_can_be_disabled(self):
+        with patch.dict(
+            os.environ,
+            {'NOTICE_OUTSIDE_RENEWAL_WINDOW_ENABLED': 'false'},
+            clear=True,
+        ):
+            self.assertFalse(main.outside_renewal_window_notice_enabled())
+
     def test_lark_signature_matches_official_hmac_format(self):
         self.assertEqual(
             main.build_lark_signature('demo', 1599360473),
